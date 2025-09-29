@@ -1,0 +1,370 @@
+from helper import *
+from model.compgcn_conv import CompGCNConv
+from model.compgcn_conv_basis import CompGCNConvBasis
+from model.GrapHD import GrapHD
+from torch.nn import init
+import qtorch
+from qtorch.quant import fixed_point_quantize, block_quantize, float_quantize
+
+
+class BaseModel(torch.nn.Module):
+	def __init__(self, params):
+		super(BaseModel, self).__init__()
+
+		self.p		= params
+		self.act	= torch.tanh
+		self.bceloss	= torch.nn.BCELoss()
+
+	def loss(self, pred, true_label):
+		return self.bceloss(pred, true_label)
+		
+class CompGCNBase(BaseModel):
+	def __init__(self, edge_index, edge_type, num_rel, params=None):
+		super(CompGCNBase, self).__init__(params)
+
+		self.edge_index		= edge_index
+		self.edge_type		= edge_type
+		self.p.gcn_dim		= self.p.embed_dim if self.p.gcn_layer == 1 else self.p.gcn_dim
+		self.init_embed		= get_param((self.p.num_ent,   self.p.init_dim))
+		self.device		= self.edge_index.device
+
+		if self.p.num_bases > 0:
+			self.init_rel  = get_param((self.p.num_bases,   self.p.init_dim))
+		else:
+			if self.p.score_func == 'transe': 	self.init_rel = get_param((num_rel,   self.p.init_dim))
+			else: 					self.init_rel = get_param((num_rel*2, self.p.init_dim))
+
+		if self.p.num_bases > 0:
+			self.conv1 = CompGCNConvBasis(self.p.init_dim, self.p.gcn_dim, num_rel, self.p.num_bases, act=self.act, params=self.p)
+			self.conv2 = CompGCNConv(self.p.gcn_dim,    self.p.embed_dim,    num_rel, act=self.act, params=self.p) if self.p.gcn_layer == 2 else None
+		else:
+			self.conv1 = CompGCNConv(self.p.init_dim, self.p.gcn_dim,      num_rel, act=self.act, params=self.p)
+			self.conv2 = CompGCNConv(self.p.gcn_dim,    self.p.embed_dim,    num_rel, act=self.act, params=self.p) if self.p.gcn_layer == 2 else None
+
+		self.register_parameter('bias', Parameter(torch.zeros(self.p.num_ent)))
+
+	def forward_base(self, sub, rel, drop1, drop2):
+		r	= self.init_rel if self.p.score_func != 'transe' else torch.cat([self.init_rel, -self.init_rel], dim=0)
+		x, r	= self.conv1(self.init_embed, self.edge_index, self.edge_type, rel_embed=r)
+		x	= drop1(x)
+		x, r	= self.conv2(x, self.edge_index, self.edge_type, rel_embed=r) 	if self.p.gcn_layer == 2 else (x, r)
+		x	= drop2(x) 							if self.p.gcn_layer == 2 else x
+
+		sub_emb	= torch.index_select(x, 0, sub)
+		rel_emb	= torch.index_select(r, 0, rel)
+
+		return sub_emb, rel_emb, x, r
+
+class GrapHDBase(BaseModel):
+	def __init__(self, edge_index, edge_type, num_rel, params=None):
+		super(GrapHDBase, self).__init__(params)
+		self.num_rel = num_rel
+		self.edge_index		= edge_index
+		self.edge_type		= edge_type
+		# self.p.gcn_dim		= self.p.embed_dim if self.p.gcn_layer == 1 else self.p.gcn_dim
+		self.p.gcn_dim		= self.p.gcn_dim
+		self.init_embed		= get_param((self.p.num_ent,   self.p.init_dim))
+		self.device		= self.edge_index.device
+
+		if self.p.num_bases > 0:
+			self.init_rel  = get_param((self.p.num_bases,   self.p.init_dim))
+		else:
+			if self.p.score_func == 'transe': 	self.init_rel = get_param((num_rel,   self.p.init_dim))
+			else: 					self.init_rel = get_param((num_rel*2, self.p.init_dim))
+
+		"""
+		if self.p.num_bases > 0:
+			self.conv1 = CompGCNConvBasis(self.p.init_dim, self.p.gcn_dim, num_rel, self.p.num_bases, act=self.act, params=self.p)
+			self.conv2 = CompGCNConv(self.p.gcn_dim,    self.p.embed_dim,    num_rel, act=self.act, params=self.p) if self.p.gcn_layer == 2 else None
+		else:
+			self.conv1 = GrapHD(self.p.init_dim, self.p.gcn_dim,      num_rel, act=self.act, params=self.p)
+			self.conv2 = CompGCNConv(self.p.gcn_dim,    self.p.embed_dim,    num_rel, act=self.act, params=self.p) if self.p.gcn_layer == 2 else None
+		"""
+		self.conv1 = GrapHD(self.p.init_dim, self.p.gcn_dim, num_rel, act=self.act, params=self.p)
+		#self.register_parameter('bias', Parameter(torch.zeros(self.p.num_ent)))
+
+	def forward_base(self, sub, rel, drop1, drop2):
+
+		r	= self.init_rel if self.p.score_func != 'transe' else torch.cat([self.init_rel, -self.init_rel], dim=0)
+		x, r	= self.conv1(self.init_embed, self.edge_index, self.edge_type, rel_embed=r)
+		#TODO: don't drop
+		x	= drop1(x)
+		"""
+		x, r	= self.conv2(x, self.edge_index, self.edge_type, rel_embed=r) 	if self.p.gcn_layer == 2 else (x, r)
+		x	= drop2(x) 							if self.p.gcn_layer == 2 else x
+		"""
+		sub_emb	= torch.index_select(x, 0, sub)
+		rel_emb	= torch.index_select(r, 0, rel)
+
+		return sub_emb, rel_emb, x, r
+
+class CompGCN_TransE(CompGCNBase):
+	def __init__(self, edge_index, edge_type, params=None):
+		super(self.__class__, self).__init__(edge_index, edge_type, params.num_rel, params)
+		self.drop = torch.nn.Dropout(self.p.hid_drop)
+
+	def forward(self, sub, rel):
+
+		sub_emb, rel_emb, all_ent, all_rel_emb	= self.forward_base(sub, rel, self.drop, self.drop)
+		obj_emb				= sub_emb + rel_emb
+
+		x	= self.p.gamma - torch.norm(obj_emb.unsqueeze(1) - all_ent, p=1, dim=2)		
+		score	= torch.sigmoid(x)
+
+		return score
+
+class CompGCN_DistMult(CompGCNBase):
+	def __init__(self, edge_index, edge_type, params=None):
+		super(self.__class__, self).__init__(edge_index, edge_type, params.num_rel, params)
+		self.drop = torch.nn.Dropout(self.p.hid_drop)
+
+	def forward(self, sub, rel, quant_model=None):
+
+		sub_emb, rel_emb, all_ent, all_rel_emb	= self.forward_base(sub, rel, self.drop, self.drop)
+		obj_emb				= sub_emb * rel_emb
+		if quant_model is not None:
+			quant_model.assign_HDV(all_ent,all_rel_emb,self.bias)
+
+		x = torch.mm(obj_emb, all_ent.transpose(1, 0))
+		x += self.bias.expand_as(x)
+
+		score = torch.sigmoid(x)
+		return score
+
+class GrapHD_DistMult(GrapHDBase):
+	def __init__(self, edge_index, edge_type, params=None) -> None:
+		super(self.__class__, self).__init__(edge_index, edge_type, params.num_rel, params)
+		self.drop = torch.nn.Dropout(self.p.hid_drop)
+	
+	def forward(self, sub, rel, quant_model=None):
+		sub_emb, rel_emb, all_ent, all_rel_emb	= self.forward_base(sub, rel, self.drop, self.drop)
+		obj_emb				= sub_emb * rel_emb
+		
+		if quant_model is not None:
+			quant_model.assign_HDV(all_ent,all_rel_emb)
+		"""
+		index = np.random.choice(512, 100)
+		obj_temp = obj_emb[:,index]
+		ent_temp = all_ent[:,index]
+		"""
+		obj_temp = obj_emb
+		ent_temp = all_ent
+
+		x = torch.mm(obj_temp, ent_temp.transpose(1, 0))
+		#x += self.bias.expand_as(x)
+		
+		score = torch.sigmoid(x)
+		return score
+
+class GrapHD_TransE(GrapHDBase):
+	def __init__(self, edge_index, edge_type, params=None):
+		super(self.__class__, self).__init__(edge_index, edge_type, params.num_rel, params)
+		self.drop = torch.nn.Dropout(self.p.hid_drop)
+
+	def forward(self, sub, rel):
+
+		sub_emb, rel_emb, all_ent, all_rel_emb	= self.forward_base(sub, rel, self.drop, self.drop)
+		obj_emb				= sub_emb + rel_emb
+
+		x	= self.p.gamma - torch.norm(obj_emb.unsqueeze(1) - all_ent, p=1, dim=2)		
+		score	= torch.sigmoid(x)
+
+		return score
+
+class CompGCN_ConvE(CompGCNBase):
+	def __init__(self, edge_index, edge_type, params=None):
+		super(self.__class__, self).__init__(edge_index, edge_type, params.num_rel, params)
+
+		self.bn0		= torch.nn.BatchNorm2d(1)
+		self.bn1		= torch.nn.BatchNorm2d(self.p.num_filt)
+		self.bn2		= torch.nn.BatchNorm1d(self.p.embed_dim)
+		
+		self.hidden_drop	= torch.nn.Dropout(self.p.hid_drop)
+		self.hidden_drop2	= torch.nn.Dropout(self.p.hid_drop2)
+		self.feature_drop	= torch.nn.Dropout(self.p.feat_drop)
+		self.m_conv1		= torch.nn.Conv2d(1, out_channels=self.p.num_filt, kernel_size=(self.p.ker_sz, self.p.ker_sz), stride=1, padding=0, bias=self.p.bias)
+
+		flat_sz_h		= int(2*self.p.k_w) - self.p.ker_sz + 1
+		flat_sz_w		= self.p.k_h 	    - self.p.ker_sz + 1
+		self.flat_sz		= flat_sz_h*flat_sz_w*self.p.num_filt
+		self.fc			= torch.nn.Linear(self.flat_sz, self.p.embed_dim)
+
+	def concat(self, e1_embed, rel_embed):
+		e1_embed	= e1_embed. view(-1, 1, self.p.embed_dim)
+		rel_embed	= rel_embed.view(-1, 1, self.p.embed_dim)
+		stack_inp	= torch.cat([e1_embed, rel_embed], 1)
+		stack_inp	= torch.transpose(stack_inp, 2, 1).reshape((-1, 1, 2*self.p.k_w, self.p.k_h))
+		return stack_inp
+
+	def forward(self, sub, rel):
+
+		sub_emb, rel_emb, all_ent, all_rel_emb	= self.forward_base(sub, rel, self.hidden_drop, self.feature_drop)
+		stk_inp				= self.concat(sub_emb, rel_emb)
+		x				= self.bn0(stk_inp)
+		x				= self.m_conv1(x)
+		x				= self.bn1(x)
+		x				= F.relu(x)
+		x				= self.feature_drop(x)
+		x				= x.view(-1, self.flat_sz)
+		x				= self.fc(x)
+		x				= self.hidden_drop2(x)
+		x				= self.bn2(x)
+		x				= F.relu(x)
+
+		x = torch.mm(x, all_ent.transpose(1,0))
+		x += self.bias.expand_as(x)
+
+		score = torch.sigmoid(x)
+		return score
+
+class quant_MLP(torch.nn.Module):
+	def __init__(self, N_V, HDC_dim, bias, ll_weight) -> None:
+		super().__init__()
+		self.fc = torch.nn.Linear(HDC_dim, N_V)
+		self.fc.weight.data = ll_weight
+		self.bias = bias
+	
+	def forward(self, x):
+		x = self.fc(x)
+		x += self.bias
+		return x
+
+class GrapHD_Dist_Quant(torch.nn.Module):
+	def __init__(self,params=None) -> None:
+		super(GrapHD_Dist_Quant, self).__init__()
+		self.p = params
+		# self.M_HDV = torch.nn.Embedding(self.p.num_ent, self.p.gcn_dim)
+		# self.R_HDV = torch.nn.Embedding(self.p.num_rel, self.p.gcn_dim)
+		# xavier_normal_(self.M_HDV.weight.data)
+		# xavier_normal_(self.R_HDV.weight.data)
+		self.M_HDV = torch.FloatTensor(self.p.num_ent, self.p.gcn_dim)
+		self.R_HDV = torch.FloatTensor(self.p.num_rel, self.p.gcn_dim)
+		self.bias = torch.zeros(self.p.num_ent)
+		# self.quant_1 = torch.quantization.QuantStub()
+		# self.quant_2 = torch.quantization.QuantStub()
+		# self.dequant = torch.quantization.DeQuantStub()
+
+	def assign_HDV(self, M_HDV, R_HDV, bias):
+		# self.M_HDV.weight.data = M_HDV.cpu()
+		# self.R_HDV.weight.data = R_HDV.cpu()
+		self.M_HDV = M_HDV.cpu()
+		self.R_HDV = R_HDV.cpu()
+		self.bias = bias.data.cpu()
+
+	def forward(self, sub, rel):
+		sub_hdv = self.M_HDV[sub]
+		rel_hdv = self.R_HDV[rel]
+		sub_temp = sub_hdv*rel_hdv
+
+		MLP = quant_MLP(self.p.num_ent,self.p.gcn_dim,self.bias,self.M_HDV)
+		
+		quant_MLP_int8 = torch.ao.quantization.quantize_dynamic(
+			MLP,  
+			{torch.nn.Linear},
+			dtype=torch.qint8)
+		x = quant_MLP_int8(sub_temp)
+		score = torch.sigmoid(x)
+		return score
+
+
+class quant_MLP1(torch.nn.Module):
+	def __init__(self, N_V, HDC_dim, bias, ll_weight) -> None:
+		super().__init__()
+		self.quant = torch.ao.quantization.QuantStub()
+		self.fc = torch.nn.Linear(HDC_dim, N_V)
+		self.fc.weight.data = ll_weight
+		self.fc.bias.data = bias
+		self.dequant = torch.ao.quantization.DeQuantStub()
+
+	def forward(self, x):
+		x = self.quant(x)
+		x = self.fc(x)
+		x = self.dequant(x)
+		return x
+
+class GrapHD_Dist_Quant1(torch.nn.Module):
+	def __init__(self,params=None) -> None:
+		super(GrapHD_Dist_Quant1, self).__init__()
+		self.p = params
+		self.M_HDV = torch.FloatTensor(self.p.num_ent, self.p.gcn_dim)
+		self.R_HDV = torch.FloatTensor(self.p.num_rel, self.p.gcn_dim)
+		self.bias = torch.zeros(self.p.num_ent)
+
+	def assign_HDV(self, M_HDV, R_HDV, bias):
+		self.M_HDV = M_HDV.cpu()
+		self.R_HDV = R_HDV.cpu()
+		self.bias = bias.data.cpu()
+
+	def forward(self, sub, rel):
+		sub_hdv = self.M_HDV[sub]
+		rel_hdv = self.R_HDV[rel]
+		sub_temp = sub_hdv*rel_hdv
+
+		MLP = quant_MLP1(self.p.num_ent,self.p.gcn_dim,self.bias,self.M_HDV)
+
+		MLP.qconfig = torch.ao.quantization.get_default_qconfig('x86')
+		MLP_prepared = torch.ao.quantization.prepare(MLP)
+		MLP_int8 = torch.ao.quantization.convert(MLP_prepared)
+		x = MLP_int8(sub_temp)
+		score = torch.sigmoid(x)
+		return score
+
+class GrapHD_Dist_Quant2(torch.nn.Module):
+	def __init__(self,params=None) -> None:
+		super(GrapHD_Dist_Quant2, self).__init__()
+		self.p = params
+		self.M_HDV = torch.FloatTensor(self.p.num_ent, self.p.gcn_dim)
+		self.R_HDV = torch.FloatTensor(self.p.num_rel, self.p.gcn_dim)
+		self.bias = torch.zeros(self.p.num_ent)
+
+	def assign_HDV(self, M_HDV, R_HDV, bias):
+		self.M_HDV = M_HDV
+		self.R_HDV = R_HDV
+		self.bias = bias.data
+
+	def forward(self, sub, rel,N_fix,N_frac):
+		sub_hdv = self.M_HDV[sub]
+		rel_hdv = self.R_HDV[rel]
+		obj_temp = fixed_point_quantize(sub_hdv*rel_hdv, N_fix,N_frac,True,True,"stochastic")
+		ent_temp = fixed_point_quantize(self.M_HDV, N_fix,N_frac,True,True,"stochastic")
+		x = torch.mm(obj_temp, ent_temp.transpose(1, 0))
+		x += fixed_point_quantize(self.bias,N_fix,N_frac,True,True,"stochastic")
+
+		score = torch.sigmoid(x)
+		return score
+
+class GrapHD_Dist_EarlyDrop(torch.nn.Module):
+	def __init__(self,params=None) -> None:
+		super(GrapHD_Dist_EarlyDrop, self).__init__()
+		self.p = params
+		self.M_HDV = torch.FloatTensor(self.p.num_ent, self.p.gcn_dim)
+		self.R_HDV = torch.FloatTensor(self.p.num_rel, self.p.gcn_dim)
+
+	def assign_HDV(self, M_HDV, R_HDV, bias=None):
+		self.M_HDV = M_HDV
+		self.R_HDV = R_HDV
+
+	def forward(self, sub, rel,N_fix,N_frac,D_sel):
+		#NOTE: Full dimension
+		#NOTE: Random select dimension
+		#index = np.random.choice(self.p.gcn_dim, D_sel)
+		index = self.dim_drop(D_sel)
+		M_HDV = self.M_HDV[:,index]
+		R_HDV = self.R_HDV[:,index]
+
+		sub_hdv = M_HDV[sub]
+		rel_hdv = R_HDV[rel]
+		obj_temp = sub_hdv*rel_hdv
+		ent_temp = M_HDV
+		x = torch.mm(obj_temp, ent_temp.transpose(1, 0))
+
+		score = torch.sigmoid(x)
+		return score
+	
+	def dim_drop(self,D_sel):
+		np.random.seed(123)
+		x = self.M_HDV.cpu().numpy()
+		p = x/x.sum(axis=0, keepdims=True)
+		p_entr = entr(p).sum(axis=0)
+		# print(p_entr.shape)
+		return np.argsort(p_entr)[-1*D_sel:]

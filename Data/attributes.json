@@ -1,0 +1,62 @@
+{
+    "Abuse": [
+      "hitting", "kicking", "power imbalance", "dominance", "victim",
+      "injury", "control", "neglect", "struggle", "disabled",
+      "misuse", "retaliation", "gang up", "apathetic", "animal",
+      "child", "coercion", "violation", "defenseless", "cornered"
+    ],
+    "Arrest": [
+      "officer", "handcuffs", "detention", "search", "police car",
+      "pin down", "resistance", "car chase", "cornered", "escape",
+      "backup", "pursuit", "running", "onlookers", "order",
+      "patrol", "security", "outnumbered", "flashing lights", "command"
+    ],
+    "Arson": [
+      "fire", "smoke", "fuel", "lighter", "night",
+      "illuminated", "throw", "explosion", "firefighter", "debris",
+      "damage", "vehicle", "collapse", "spoliation", "blaze",
+      "house", "explosion", "run", "spark", "escape"
+    ],
+    "Assault": [
+      "punch", "kick", "brawl", "rage", "conflict",
+      "push", "grab", "intervention", "bystander", "weapon",
+      "prison", "status", "escape", "pursuit", "retaliation",
+      "threat", "fall", "crowd", "surprise", "strike"
+    ],
+    "Burglary": [
+      "trespass", "lockpick", "hoodie", "crawl", "vigilant",
+      "bags", "looting", "flee", "vacant", "night",
+      "scanning", "safe", "valuables", "drawer", "hook",
+      "car", "steal", "camera", "broken glass", "property"
+    ],
+    "Explosion": [
+      "blast", "illuminated", "blaze", "smoke", "debris",
+      "car", "collision", "onlookers", "run", "burned",
+      "panic", "shock wave", "crowd", "gasoline", "street",
+      "impact", "collapse", "fireball", "dust", "industrial"
+    ],
+    "Fighting": [
+      "punch", "kick", "throw", "intervention", "argue",
+      "escalate", "altercation", "public", "street", "store",
+      "push", "grab", "crowd", "upset", "demonstration",
+      "brawl", "riot", "conflict", "retaliation", "chaos"
+    ],
+    "Normal Videos": [
+      "office", "driving", "sitting", "walking", "relaxing",
+      "studying", "concentration", "vacant", "entering", "exiting",
+      "stillness", "peaceful", "shopping", "reading", "queueing",
+      "crosswalk", "parking", "friends", "meeting", "happy"
+    ],
+    "Road Accidents": [
+      "collision", "debris", "intersection", "automobile", "fast",
+      "mistake", "inattentive", "pedestrian", "onlookers", "bump",
+      "parking", "gasoline", "ice", "skid", "injured",
+      "rear-end", "traffic", "road", "fog", "report"
+    ],
+    "Robbery": [
+      "chase", "cashier", "hoodie", "threat", "gunpoint",
+      "convenience store", "run", "steal", "loot", "counter",
+      "cash", "register", "escape", "holdup", "stick-up",
+      "vehicle", "mask", "disguise", "intimidation", "bank"
+    ]
+  }

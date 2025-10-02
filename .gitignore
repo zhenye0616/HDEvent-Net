@@ -1,0 +1,29 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Package/build artifacts
+build/
+dist/
+*.egg-info/
+
+# Checkpoints and model weights
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+
+# Logs and temp files
+*.log
+logs/
+tmp/
+
+# Environment / config overrides
+.env
+.venv/
+venv/
+
+# OS metadata
+.DS_Store
+Thumbs.db

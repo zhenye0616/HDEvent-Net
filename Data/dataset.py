@@ -2,7 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Optional
-import re
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -30,8 +29,6 @@ CLASS_LIST_DEFAULT = [
     "Normal","RoadAccidents","Robbery","Shooting","Shoplifting","Stealing","Vandalism"
 ]
 
-_vidseg_re = re.compile(r"(.*?)[_\-]?(?:seg)?(\d+)$")  # best-effort: Foo_0001_seg07 → (Foo_0001, 7)
-
 
 @dataclass
 class Event_Seg:
@@ -39,8 +36,7 @@ class Event_Seg:
     class_idx: int
     class_name: str
     video_id: str
-    segment_idx: int
-    segment_id: str  # f"{video_id}:{segment_idx}"
+    augmentation_idx: Optional[int]
 
 
 class UCFCrimeEventDataset(Dataset):
@@ -50,7 +46,7 @@ class UCFCrimeEventDataset(Dataset):
       - temporal_features: FloatTensor [T, d] (T>=1)
       - pooled_features:  FloatTensor [d]
       - label: int (class index)
-      - metadata: dict (class_name, file_path, video_id, segment_idx, segment_id)
+      - metadata: dict (class_name, file_path, video_id, augmentation_idx)
     """
     def __init__(
         self,
@@ -58,6 +54,7 @@ class UCFCrimeEventDataset(Dataset):
         split: str = "event_thr_10",
         classes: Optional[List[str]] = None,
         max_samples_per_class: Optional[int] = None,
+        augmentation_idx: Optional[int] = None,
     ):
         self.data_root = Path(data_root)
         self.split = split
@@ -85,31 +82,35 @@ class UCFCrimeEventDataset(Dataset):
 
         # collect samples
         self.samples: List[Event_Seg] = []
+        self.augmentation_idx = augmentation_idx  # Optional filter for augmentation method
         for cname in classes:
             cdir = (self.split_dir / cname)
             files = sorted(cdir.glob("*.npy"))
-            if max_samples_per_class is not None:
-                files = files[:max_samples_per_class]
+            added = 0
             for p in files:
                 stem = p.stem  # filename w/o .npy
-                # try to parse video id & segment index from filename
-                m = _vidseg_re.search(stem)
-                if m:
-                    vid, seg_str = m.group(1), m.group(2)
-                    seg_idx = int(seg_str)
-                else:
-                    vid, seg_idx = stem, 0
-                seg_id = f"{vid}:{seg_idx}"
+                video_id = stem
+                aug_idx: Optional[int] = None
+                # Split augmentation marker if present (e.g., Foo__5 → aug_idx=5)
+                if "__" in stem:
+                    base_candidate, aug_candidate = stem.rsplit("__", 1)
+                    if aug_candidate.isdigit():
+                        aug_idx = int(aug_candidate)
+                        video_id = base_candidate
+                if self.augmentation_idx is not None and aug_idx != self.augmentation_idx:
+                    continue
                 self.samples.append(
                     Event_Seg(
                         path=p,
                         class_idx=self.class_to_idx[cname],
                         class_name=cname,
-                        video_id=vid,
-                        segment_idx=seg_idx,
-                        segment_id=seg_id,
+                        video_id=video_id,
+                        augmentation_idx=aug_idx,
                     )
                 )
+                added += 1
+                if max_samples_per_class is not None and added >= max_samples_per_class:
+                    break
 
         print(f"[UCFCrimeEventDataset] {len(self.samples)} samples from {len(classes)} classes in '{self.split}'")
 
@@ -136,8 +137,7 @@ class UCFCrimeEventDataset(Dataset):
                 "class_name":   s.class_name,
                 "file_path":    str(s.path),
                 "video_id":     s.video_id,
-                "segment_idx":  s.segment_idx,
-                "segment_id":   s.segment_id,
+                "augmentation_idx": s.augmentation_idx,
             }
         }
 

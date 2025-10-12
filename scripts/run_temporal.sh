@@ -11,9 +11,11 @@ DATA_ROOT="/mnt/Data_1/UCFCrime_dataset"
 VARIANT="vitb"
 SPLIT="event_thr_10"
 CHECKPOINT="/home/biaslab/Zhen/HDEvent-Net/ckpt/vitb.pt"
-CLASSES="Abuse"
+CLASSES="Abuse Arrest Arson "
+#CLASSES="Abuse Arrest Arson Assault Burglary Explosion Fighting RoadAccidents Robbery"
 TOP_K=20
-MAX_SAMPLES=500
+AUG_IDX=5
+MAX_SAMPLES=50
 
 # Run with CLIP logits and temporal segments
 python Utils/attribute_similarity.py $DATA_ROOT \
@@ -24,6 +26,7 @@ python Utils/attribute_similarity.py $DATA_ROOT \
   --use-temporal \
   --use-logits \
   --max-samples $MAX_SAMPLES \
+  --augmentation-idx $AUG_IDX \
   --top-k $TOP_K \
   --log-level info
 

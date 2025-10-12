@@ -124,6 +124,20 @@ def _safe_normalize(tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return tensor / norms
 
 
+def _format_sample_id(sample) -> str:
+    """
+    Prefer human-readable identifiers based on video id and augmentation index.
+    Falls back to legacy segment_id if available.
+    """
+    video_id = getattr(sample, "video_id", None)
+    aug_idx = getattr(sample, "augmentation_idx", None)
+    if video_id is None:
+        return getattr(sample, "segment_id", "<unknown>")
+    if aug_idx is None:
+        return video_id
+    return f"{video_id}:aug{aug_idx}"
+
+
 def compute_similarity(
     event_embeddings: torch.Tensor,
     attribute_embeddings: torch.Tensor,
@@ -284,7 +298,7 @@ def analyze_class_similarity(
                 if not torch.isfinite(scores).all():
                     logger.warning(
                         "Non-finite scores detected for sample %s; replacing with zeros",
-                        getattr(sample, "segment_id", "<unknown>")
+                        _format_sample_id(sample)
                     )
                 scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -292,7 +306,7 @@ def analyze_class_similarity(
                 avg_scores = scores.mean(dim=0)  # [M]
                 all_similarities.append(avg_scores)
 
-                logger.debug(f"  Sample {sample.segment_id}: {T} temporal segments")
+                logger.debug(f"  Sample {_format_sample_id(sample)}: {T} temporal segments")
             else:
                 # Use pooled features: [d]
                 event_emb = data["pooled_features"].unsqueeze(0)  # [1, d]
@@ -306,7 +320,7 @@ def analyze_class_similarity(
                 if not torch.isfinite(scores).all():
                     logger.warning(
                         "Non-finite scores detected for sample %s; replacing with zeros",
-                        getattr(sample, "segment_id", "<unknown>")
+                        _format_sample_id(sample)
                     )
                 scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
                 all_similarities.append(scores[0])
@@ -342,7 +356,7 @@ def analyze_class_similarity(
                 if not torch.isfinite(scores).all():
                     logger.warning(
                         "Non-finite per-segment scores detected for sample %s; replacing with zeros",
-                        getattr(sample, "segment_id", "<unknown>")
+                        _format_sample_id(sample)
                     )
                 scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
                 all_segment_scores.append(scores)
@@ -418,6 +432,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to Event-CLIP checkpoint (vitb.pt or vitl.pt)",
     )
     parser.add_argument(
+        "--augmentation-idx",
+        type=int,
+        default=None,
+        help="Only use samples with the specified augmentation index (optional)",
+    )
+    parser.add_argument(
         "--model-type",
         default="ViT-B/32",
         choices=["ViT-B/32", "ViT-L/14"],
@@ -465,11 +485,14 @@ def main() -> None:
     # Load dataset
     data_root = args.data_root / args.variant if args.variant else args.data_root
     logger.info(f"Loading dataset from {data_root / args.split}")
+    if args.augmentation_idx is not None:
+        logger.info(f"Filtering for augmentation index {args.augmentation_idx}")
 
     dataset = UCFCrimeEventDataset(
         data_root=data_root,
         split=args.split,
         classes=args.classes,
+        augmentation_idx=args.augmentation_idx,
     )
 
     # Analyze similarity

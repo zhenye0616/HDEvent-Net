@@ -1,5 +1,5 @@
-from helper import *
-from model.message_passing import MessagePassing
+from Utils.KG_helper import *
+from Model.message_passing import MessagePassing
 
 class CompGCNConvBasis(MessagePassing):
 	def __init__(self, in_channels, out_channels, num_rels, num_bases, act=lambda x:x, cache=True, params=None):

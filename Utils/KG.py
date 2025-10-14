@@ -1,7 +1,7 @@
 from KG_helper import *
 from data_loader import *
-
-# sys.path.append('./')
+import sys
+sys.path.append('./')
 from Model.models import *
 from copy import deepcopy
 import tqdm as tqdm
@@ -26,15 +26,15 @@ class Runner(object):
 		self.num_rel:           Number of relations in the Knowledge graph
 		self.embed_dim:         Embedding dimension used
 		self.data['train']:     Stores the triples corresponding to training dataset
-		self.data['valid']:     Stores the triples corresponding to validation dataset
+		self.data['val']:     Stores the triples corresponding to validation dataset
 		self.data['test']:      Stores the triples corresponding to test dataset
 		self.data_iter:		The dataloader for different data splits
 
 		"""
 
 		ent_set, rel_set = OrderedSet(), OrderedSet()
-		for split in ['train', 'test', 'valid']:
-			for line in open('./data/{}/{}.txt'.format(self.p.dataset, split)):
+		for split in ['train', 'test', 'val']:
+			for line in open('./Data/{}/{}.txt'.format(self.p.dataset, split)):
 				sub, rel, obj = map(str.lower, line.strip().split('\t'))
 				ent_set.add(sub)
 				rel_set.add(rel)
@@ -54,8 +54,8 @@ class Runner(object):
 		self.data = ddict(list)
 		sr2o = ddict(set)
 
-		for split in ['train', 'test', 'valid']:
-			for line in open('./data/{}/{}.txt'.format(self.p.dataset, split)):
+		for split in ['train', 'test', 'val']:
+			for line in open('./Data/{}/{}.txt'.format(self.p.dataset, split)):
 				sub, rel, obj = map(str.lower, line.strip().split('\t'))
 				sub, rel, obj = self.ent2id[sub], self.rel2id[rel], self.ent2id[obj]
 				self.data[split].append((sub, rel, obj))
@@ -67,7 +67,7 @@ class Runner(object):
 		self.data = dict(self.data)
 
 		self.sr2o = {k: list(v) for k, v in sr2o.items()}
-		for split in ['test', 'valid']:
+		for split in ['test', 'val']:
 			for sub, rel, obj in self.data[split]:
 				sr2o[(sub, rel)].add(obj)
 				sr2o[(obj, rel+self.p.num_rel)].add(sub)
@@ -78,7 +78,7 @@ class Runner(object):
 		for (sub, rel), obj in self.sr2o.items():
 			self.triples['train'].append({'triple':(sub, rel, -1), 'label': self.sr2o[(sub, rel)], 'sub_samp': 1})
 
-		for split in ['test', 'valid']:
+		for split in ['test', 'val']:
 			for sub, rel, obj in self.data[split]:
 				rel_inv = rel + self.p.num_rel
 				self.triples['{}_{}'.format(split, 'tail')].append({'triple': (sub, rel, obj), 	   'label': self.sr2o_all[(sub, rel)]})
@@ -97,8 +97,8 @@ class Runner(object):
 
 		self.data_iter = {
 			'train':    	get_data_loader(TrainDataset, 'train', 	    self.p.batch_size),
-			'valid_head':   get_data_loader(TestDataset,  'valid_head', self.p.batch_size),
-			'valid_tail':   get_data_loader(TestDataset,  'valid_tail', self.p.batch_size),
+			'val_head':   get_data_loader(TestDataset,  'val_head', self.p.batch_size),
+			'val_tail':   get_data_loader(TestDataset,  'val_tail', self.p.batch_size),
 			'test_head':   	get_data_loader(TestDataset,  'test_head',  self.p.batch_size),
 			'test_tail':   	get_data_loader(TestDataset,  'test_tail',  self.p.batch_size),
 		}
@@ -218,7 +218,7 @@ class Runner(object):
 		Parameters
 		----------
 		batch: 		the batch to process
-		split: (string) If split == 'train', 'valid' or 'test' split
+		split: (string) If split == 'train', 'val' or 'test' split
 
 		
 		Returns
@@ -278,7 +278,7 @@ class Runner(object):
 
 		Parameters
 		----------
-		split: (string) If split == 'valid' then evaluate on the validation set, else the test set
+		split: (string) If split == 'val' then evaluate on the validation set, else the test set
 		epoch: (int) Current epoch count
 		
 		Returns
@@ -362,13 +362,13 @@ class Runner(object):
 
 		return results
 
-	def predict(self, split='valid', mode='tail_batch', quant_model=None):
+	def predict(self, split='val', mode='tail_batch', quant_model=None):
 		"""
 		Function to run model evaluation for a given mode
 
 		Parameters
 		----------
-		split: (string) 	If split == 'valid' then evaluate on the validation set, else the test set
+		split: (string) 	If split == 'val' then evaluate on the validation set, else the test set
 		mode: (string):		Can be 'head_batch' or 'tail_batch'
 		
 		Returns
@@ -473,7 +473,7 @@ class Runner(object):
 		kill_cnt = 0
 		for epoch in range(self.p.max_epochs):
 			train_loss  = self.run_epoch(epoch, val_mrr)
-			val_results = self.evaluate('valid', epoch)
+			val_results = self.evaluate('val', epoch)
 
 			if val_results['mrr'] > self.best_val_mrr:
 				self.best_val	   = val_results

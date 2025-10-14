@@ -1,5 +1,5 @@
-from helper import *
-from model.message_passing import MessagePassing
+from Utils.KG_helper import *
+from Model.message_passing import MessagePassing
 import numpy as np
 
 #NOTE:Autoencoder for Ali's paper

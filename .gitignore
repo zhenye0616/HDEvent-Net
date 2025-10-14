@@ -18,6 +18,7 @@ checkpoints/
 # Logs and temp files
 *.log
 logs/
+log/
 tmp/
 
 # Environment / config overrides
@@ -28,3 +29,7 @@ venv/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Generated manifests and segment metadata
+*.txt
+*.jsonl

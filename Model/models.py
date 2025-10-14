@@ -1,10 +1,12 @@
-from helper import *
-from model.compgcn_conv import CompGCNConv
-from model.compgcn_conv_basis import CompGCNConvBasis
-from model.GrapHD import GrapHD
+import sys
+sys.path.append('./')
+from Utils.KG_helper import *
+from Model.compgcn_conv import CompGCNConv
+from Model.compgcn_conv_basis import CompGCNConvBasis
+from Model.GrapHD import GrapHD
 from torch.nn import init
-import qtorch
-from qtorch.quant import fixed_point_quantize, block_quantize, float_quantize
+# import qtorch
+# from qtorch.quant import fixed_point_quantize, block_quantize, float_quantize
 
 
 class BaseModel(torch.nn.Module):

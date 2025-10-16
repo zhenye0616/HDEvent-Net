@@ -127,7 +127,7 @@ Compute similarity between semantic attributes and event features using Event-CL
 
 **Quick start (uses default settings):**
 ```bash
-bash run.sh
+bash run_temporal.sh
 ```
 
 **Using pooled features (mean-pooled over entire video):**

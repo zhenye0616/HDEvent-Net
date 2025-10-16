@@ -33,3 +33,6 @@ Thumbs.db
 # Generated manifests and segment metadata
 *.txt
 *.jsonl
+
+# .md files for coding agents
+CLAUDE.md

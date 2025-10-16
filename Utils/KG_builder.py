@@ -2,7 +2,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 
 def _slugify(text: str) -> str:
@@ -65,6 +65,43 @@ def _load_segments_for_split(segments_root: Path, split: str) -> Dict[str, List[
     return segments_by_video
 
 
+def load_segment_attributes(path: Path) -> Dict[str, List[Dict[str, float]]]:
+    segment_to_attrs: Dict[str, List[Dict[str, float]]] = {}
+    if not path.exists():
+        return segment_to_attrs
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            seg_name = record.get("segment")
+            attrs = record.get("top_attributes", [])
+            if seg_name:
+                segment_to_attrs[seg_name.strip().lower()] = attrs
+    return segment_to_attrs
+
+
+def sanitize_video_filename(video_entity: str) -> str:
+    return (
+        video_entity.replace("/", "__")
+        .replace("\\", "__")
+        .replace(":", "_")
+        .replace(" ", "_")
+    )
+
+
+def segment_class_from_name(segment_name: str) -> Optional[str]:
+    if not segment_name.startswith("seg:"):
+        return None
+    payload = segment_name[len("seg:") :]
+    parts = payload.split("/")
+    if len(parts) < 4:
+        return None
+    return parts[3]
+
+
 def _load_manifest_videos(manifest_root: Path, split: str) -> List[str]:
     path = manifest_root / f"{split}.txt"
     if not path.exists():
@@ -109,6 +146,7 @@ def build_triple_files(
     manifest_root: Path,
     output_root: Path,
     splits: Iterable[str] = ("train", "val", "test"),
+    segment_attrs_root: Optional[Path] = None,
 ) -> None:
     segments_root = Path(segments_root)
     manifest_root = Path(manifest_root)
@@ -124,13 +162,57 @@ def build_triple_files(
             continue
 
         lines: List[str] = []
+        attrs_lookup: Dict[str, Dict[str, List[Dict[str, float]]]] = {}
+        if segment_attrs_root is not None:
+            attrs_dir = Path(segment_attrs_root) / split
+            if attrs_dir.exists():
+                for attr_path in attrs_dir.glob("*.jsonl"):
+                    records = load_segment_attributes(attr_path)
+                    if not records:
+                        continue
+                    with attr_path.open("r", encoding="utf-8") as handle:
+                        first_line = handle.readline().strip()
+                        if not first_line:
+                            continue
+                        try:
+                            payload = json.loads(first_line)
+                        except json.JSONDecodeError:
+                            continue
+                    video_name = payload.get("video")
+                    if not video_name:
+                        continue
+                    try:
+                        canonical_name = canonical_video_entity(video_name)
+                    except Exception:
+                        continue
+                    attrs_lookup[canonical_name] = records
         for video_entity in all_videos:
             segments = segments_by_video.get(video_entity, [])
             if not segments:
                 continue
+            attr_records: Dict[str, List[Dict[str, float]]] = {}
+            if segment_attrs_root is not None:
+                attr_records = attrs_lookup.get(video_entity, {})
+            attr_class_cache: Optional[str] = None
             for triple in _iter_structure_triples(video_entity, segments):
                 sub, rel, obj = (triple[0].lower(), triple[1].lower(), triple[2].lower())
                 lines.append("\t".join((sub, rel, obj)))
+            if attr_records:
+                for segment in segments:
+                    if segment in attr_records:
+                        if attr_class_cache is None:
+                            class_name = segment_class_from_name(segment)
+                            attr_class_cache = _slugify(class_name) if class_name else None
+                        class_slug = attr_class_cache
+                        if not class_slug:
+                            continue
+                        for attr in attr_records[segment]:
+                            attr_name = attr.get("name")
+                            if not attr_name:
+                                continue
+                            attr_slug = _slugify(attr_name)
+                            attr_entity = f"attribute:{class_slug}:{attr_slug}"
+                            lines.append("\t".join((segment, "has_attribute", attr_entity)))
 
         out_path = output_root / f"{split}.txt"
         with out_path.open("w", encoding="utf-8") as handle:
@@ -144,6 +226,7 @@ def _build_triples_cli(args: argparse.Namespace) -> None:
         manifest_root=args.manifest_root,
         output_root=args.output_root,
         splits=args.splits,
+        segment_attrs_root=args.segment_attrs_root,
     )
 
 
@@ -171,6 +254,12 @@ def _parse_cli_arguments() -> argparse.Namespace:
         type=Path,
         default=Path("HDEvent-Net/Data/UCF_Crime"),
         help="Directory to write split triple files.",
+    )
+    build_parser.add_argument(
+        "--segment-attrs-root",
+        type=Path,
+        default=None,
+        help="Optional directory with per-segment attribute JSONLs",
     )
     build_parser.add_argument(
         "--splits",

@@ -5,8 +5,9 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional, Set
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import clip 
@@ -16,6 +17,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from Data.dataset import UCFCrimeEventDataset
+from Utils.precompute_segments import load_event_stream
 
 def _configure_logging(level_name: str) -> logging.Logger:
     level = getattr(logging, level_name.upper(), logging.INFO)
@@ -138,6 +140,135 @@ def _format_sample_id(sample) -> str:
     return f"{video_id}:aug{aug_idx}"
 
 
+def _build_video_entity(
+    sample,
+    variant: str,
+    feature_split: str,
+    video_prefix: str = "video",
+) -> str:
+    """
+    Construct the canonical video entity identifier used by the segmenter.
+    Format: video:<variant>:<feature_split>:<Class>/<VideoId>__<aug_idx?>
+    """
+    class_name = getattr(sample, "class_name", None)
+    video_id = getattr(sample, "video_id", None)
+    aug_idx = getattr(sample, "augmentation_idx", None)
+
+    if class_name is None or video_id is None:
+        raise ValueError("Sample missing class_name or video_id; cannot build video entity.")
+
+    aug_suffix = f"__{aug_idx}" if aug_idx is not None else ""
+
+    parts = [video_prefix]
+    if variant:
+        parts.append(variant)
+    if feature_split:
+        parts.append(feature_split)
+    return ":".join(parts) + f":{class_name}/{video_id}{aug_suffix}"
+
+
+def _sanitize_video_filename(video_entity: str) -> str:
+    """
+    Mirror the sanitization used in precompute_segments when writing JSONL files.
+    """
+    return (
+        video_entity.replace("/", "__")
+        .replace("\\", "__")
+        .replace(":", "_")
+        .replace(" ", "_")
+    )
+
+
+def _load_segments_jsonl(path: Path) -> List[Dict]:
+    segments: List[Dict] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            segments.append(json.loads(line))
+    return segments
+
+
+def _aggregate_segment_scores(
+    scores: torch.Tensor,
+    timestamps_ms: np.ndarray,
+    segments: List[Dict],
+    attribute_list: List[str],
+    top_k: int,
+    threshold: Optional[float],
+    aggregate: str,
+    video_entity: str,
+    logger: logging.Logger,
+) -> List[Dict]:
+    """
+    Aggregate attribute scores for each segment using timestamp ranges.
+    """
+    if scores.device.type != "cpu":
+        scores = scores.cpu()
+
+    timestamps = np.asarray(timestamps_ms)
+    results: List[Dict] = []
+
+    for segment in segments:
+        start_ms = segment.get("start_ms")
+        end_ms = segment.get("end_ms")
+        if start_ms is None or end_ms is None:
+            continue
+
+        mask = (timestamps >= start_ms) & (timestamps <= end_ms)
+        indices = np.flatnonzero(mask)
+        if indices.size == 0:
+            logger.debug(
+                "Segment %s in %s matched 0 events (start=%s end=%s)",
+                segment.get("seg_name"),
+                video_entity,
+                start_ms,
+                end_ms,
+            )
+            continue
+
+        idx_tensor = torch.from_numpy(indices).long()
+        segment_scores = scores.index_select(0, idx_tensor)
+
+        if aggregate == "mean":
+            agg_scores = segment_scores.mean(dim=0)
+        elif aggregate == "max":
+            agg_scores, _ = segment_scores.max(dim=0)
+        else:
+            raise ValueError(f"Unknown aggregate method: {aggregate}")
+
+        k = min(top_k, agg_scores.shape[0])
+        values, indices_top = torch.topk(agg_scores, k=k)
+
+        top_attributes = []
+        for value, attr_idx in zip(values.tolist(), indices_top.tolist()):
+            if threshold is not None and value < threshold:
+                continue
+            top_attributes.append(
+                {
+                    "name": attribute_list[attr_idx],
+                    "score": float(value),
+                }
+            )
+
+        if not top_attributes:
+            continue
+
+        results.append(
+            {
+                "segment": segment.get("seg_name"),
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "n_events": segment.get("n_events"),
+                "flags": segment.get("flags", []),
+                "top_attributes": top_attributes,
+            }
+        )
+
+    return results
+
+
 def compute_similarity(
     event_embeddings: torch.Tensor,
     attribute_embeddings: torch.Tensor,
@@ -213,7 +344,18 @@ def analyze_class_similarity(
     use_temporal: bool = False,
     use_logits: bool = False,
     max_samples: int = 10,
-    logger: logging.Logger = None
+    logger: logging.Logger = None,
+    *,
+    segments_root: Optional[Path] = None,
+    segments_split: str = "train",
+    segment_output_dir: Optional[Path] = None,
+    segment_top_k: int = 5,
+    segment_threshold: Optional[float] = None,
+    segment_aggregate: str = "mean",
+    data_root: Optional[Path] = None,
+    feature_split: str = "",
+    variant: str = "",
+    sample_period_ms: float = 1.0,
 ):
     """
     Analyze similarity between event embeddings and attributes for target classes.
@@ -253,6 +395,20 @@ def analyze_class_similarity(
     logger.info(f"\nAnalyzing for classes: {list(class_indices.keys())}")
     logger.info(f"Using {'temporal segments' if use_temporal else 'pooled features'}")
     logger.info(f"Metric: {'CLIP logits' if use_logits else 'cosine similarity'}")
+
+    enable_segment_output = segment_output_dir is not None and use_temporal
+    if enable_segment_output:
+        segments_root = Path(segments_root) if segments_root else Path("HDEvent-Net/Data/segments")
+        segment_output_dir = Path(segment_output_dir)
+        segment_output_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        segments_root = None
+        segment_output_dir = None
+
+    events_data_root = data_root if data_root is not None else dataset.data_root
+    segment_cache: Dict[str, List[Dict]] = {}
+    event_cache: Dict[str, Dict] = {}
+    exported_videos: Set[str] = set()
 
     for class_name, class_idx in class_indices.items():
         logger.info(f"\n{'='*60}")
@@ -307,6 +463,79 @@ def analyze_class_similarity(
                 all_similarities.append(avg_scores)
 
                 logger.debug(f"  Sample {_format_sample_id(sample)}: {T} temporal segments")
+
+                if enable_segment_output:
+                    try:
+                        video_entity = _build_video_entity(sample, variant, feature_split)
+                    except ValueError as exc:
+                        logger.warning("Skipping segment export: %s", exc)
+                        continue
+
+                    if video_entity in exported_videos:
+                        continue
+
+                    safe_id = _sanitize_video_filename(video_entity)
+                    if segments_root is None:
+                        continue
+                    segment_file = segments_root / segments_split / f"{safe_id}.jsonl"
+                    if not segment_file.exists():
+                        logger.debug("Segment file not found for %s (%s)", video_entity, segment_file)
+                        continue
+
+                    if video_entity in segment_cache:
+                        segments = segment_cache[video_entity]
+                    else:
+                        segments = _load_segments_jsonl(segment_file)
+                        segment_cache[video_entity] = segments
+
+                    if video_entity in event_cache:
+                        event_stream = event_cache[video_entity]
+                    else:
+                        try:
+                            event_stream = load_event_stream(
+                                video_entity,
+                                segments_split,
+                                events_data_root,
+                                logger,
+                                feature_split=feature_split,
+                                sample_period_ms=sample_period_ms,
+                            )
+                        except FileNotFoundError:
+                            logger.warning("Could not reload event stream for %s", video_entity)
+                            continue
+                        event_cache[video_entity] = event_stream
+
+                    scores_cpu = scores.detach().cpu()
+
+                    segment_records = _aggregate_segment_scores(
+                        scores=scores_cpu,
+                        timestamps_ms=event_stream["timestamps_ms"],
+                        segments=segments,
+                        attribute_list=attribute_list,
+                        top_k=segment_top_k,
+                        threshold=segment_threshold,
+                        aggregate=segment_aggregate,
+                        video_entity=video_entity,
+                        logger=logger,
+                    )
+
+                    if segment_records:
+                        out_dir = segment_output_dir / segments_split
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        out_path = out_dir / f"{safe_id}.jsonl"
+                        with out_path.open("w", encoding="utf-8") as handle:
+                            for record in segment_records:
+                                payload = {
+                                    "segment": record["segment"],
+                                    "video": video_entity,
+                                    "start_ms": record["start_ms"],
+                                    "end_ms": record["end_ms"],
+                                    "n_events": record["n_events"],
+                                    "flags": record["flags"],
+                                    "top_attributes": record["top_attributes"],
+                                }
+                                handle.write(json.dumps(payload) + "\n")
+                        exported_videos.add(video_entity)
             else:
                 # Use pooled features: [d]
                 event_emb = data["pooled_features"].unsqueeze(0)  # [1, d]
@@ -426,6 +655,49 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of samples to analyze per class (default: 10)",
     )
     parser.add_argument(
+        "--segments-root",
+        type=Path,
+        default=Path("HDEvent-Net/Data/segments"),
+        help="Directory containing precomputed segment JSONLs",
+    )
+    parser.add_argument(
+        "--segments-split",
+        type=str,
+        default="train",
+        choices=("train", "val", "test"),
+        help="Manifest split aligned with segment JSONLs",
+    )
+    parser.add_argument(
+        "--segment-output-dir",
+        type=Path,
+        default=None,
+        help="If set, write per-segment attribute scores (JSONL) to this directory",
+    )
+    parser.add_argument(
+        "--segment-top-k",
+        type=int,
+        default=5,
+        help="Number of top attributes to keep per segment",
+    )
+    parser.add_argument(
+        "--segment-threshold",
+        type=float,
+        default=None,
+        help="Optional minimum score threshold for segment attributes",
+    )
+    parser.add_argument(
+        "--segment-aggregate",
+        choices=("mean", "max"),
+        default="mean",
+        help="Aggregation method for segment scores",
+    )
+    parser.add_argument(
+        "--sample-period-ms",
+        type=float,
+        default=1.0,
+        help="Sample period (ms) used when reconstructing timestamps",
+    )
+    parser.add_argument(
         "--checkpoint",
         type=Path,
         default=None,
@@ -505,7 +777,17 @@ def main() -> None:
         use_temporal=args.use_temporal,
         use_logits=args.use_logits,
         max_samples=args.max_samples,
-        logger=logger
+        logger=logger,
+        segments_root=args.segments_root,
+        segments_split=args.segments_split,
+        segment_output_dir=args.segment_output_dir,
+        segment_top_k=args.segment_top_k,
+        segment_threshold=args.segment_threshold,
+        segment_aggregate=args.segment_aggregate,
+        data_root=data_root,
+        feature_split=args.split,
+        variant=args.variant,
+        sample_period_ms=args.sample_period_ms,
     )
 
 

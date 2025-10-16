@@ -21,6 +21,7 @@ FEATURE_SPLIT="event_thr_10"
 SEGMENTS_ROOT="Data/segments"
 MANIFEST_ROOT="Data/UCF_Crime"
 OUTPUT_ROOT="Data/UCF_Crime"
+SEGMENT_ATTRS_ROOT="Data/segment_attributes"
 ATTRIBUTES_PATH="Data/attributes.json"
 TARGET_EVENTS=10000
 DT_MIN=10
@@ -52,6 +53,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --output-root)
             OUTPUT_ROOT="$2"
+            shift 2
+            ;;
+        --segment-attrs-root)
+            SEGMENT_ATTRS_ROOT="$2"
             shift 2
             ;;
         --attributes)
@@ -133,11 +138,17 @@ for split in "${SPLITS[@]}"; do
 done
 
 echo "[INFO] Building structural triples into ${OUTPUT_ROOT}"
-${PYTHON} Utils/KG_builder.py build-triples \
-    --segments-root "${SEGMENTS_ROOT}" \
-    --manifest-root "${MANIFEST_ROOT}" \
-    --output-root "${OUTPUT_ROOT}" \
+KG_BUILDER_CMD=(
+    ${PYTHON} Utils/KG_builder.py build-triples
+    --segments-root "${SEGMENTS_ROOT}"
+    --manifest-root "${MANIFEST_ROOT}"
+    --output-root "${OUTPUT_ROOT}"
     --splits "${SPLITS[@]}"
+)
+if [[ -n "${SEGMENT_ATTRS_ROOT}" ]]; then
+    KG_BUILDER_CMD+=(--segment-attrs-root "${SEGMENT_ATTRS_ROOT}")
+fi
+"${KG_BUILDER_CMD[@]}"
 
 echo "[INFO] Regenerating entity and relation ID maps"
 ${PYTHON} Utils/build_kg_indices.py \

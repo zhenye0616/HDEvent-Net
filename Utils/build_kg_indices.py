@@ -173,19 +173,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--attributes",
         type=Path,
-        default=Path("HDEvent-Net/Data/attributes.json"),
+        default=Path("Data/attributes.json"),
         help="Path to attributes.json file.",
     )
     parser.add_argument(
         "--segments-root",
         type=Path,
-        default=Path("HDEvent-Net/Data/segments"),
+        default=Path("Data/segments"),
         help="Root directory containing segment JSONLs.",
     )
     parser.add_argument(
         "--manifest-root",
         type=Path,
-        default=Path("HDEvent-Net/Data/UCF_Crime"),
+        default=Path("Data/UCF_Crime"),
         help="Directory with train/val/test manifests.",
     )
     parser.add_argument(
@@ -197,13 +197,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--entity-output",
         type=Path,
-        default=Path("HDEvent-Net/Data/entity2id.txt"),
+        default=Path("Data/entity2id.txt"),
         help="Output path for entity2id mapping.",
     )
     parser.add_argument(
         "--relation-output",
         type=Path,
-        default=Path("HDEvent-Net/Data/relation2id.txt"),
+        default=Path("Data/relation2id.txt"),
         help="Output path for relation2id mapping.",
     )
     parser.add_argument(

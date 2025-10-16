@@ -346,7 +346,7 @@ class Runner(object):
 				pred = pred.cuda()
 				b_range			= torch.arange(pred.size()[0], device=self.device)
 				target_pred		= pred[b_range, obj]
-				pred 			= torch.where(label.byte(), (-torch.ones_like(pred) * 10000000), pred)
+				pred 			= torch.where(label.bool(), (-torch.ones_like(pred) * 10000000), pred)
 				pred[b_range, obj] 	= target_pred
 				ranks			= 1 + torch.argsort(torch.argsort(pred, dim=1, descending=True), dim=1, descending=False)[b_range, obj]
 
@@ -387,10 +387,10 @@ class Runner(object):
 
 			for step, batch in enumerate(train_iter):
 				sub, rel, obj, label	= self.read_batch(batch, split)
-				pred			= self.model.forward(sub, rel,quant_model)
+				pred		= self.model.forward(sub, rel)
 				b_range			= torch.arange(pred.size()[0], device=self.device)
 				target_pred		= pred[b_range, obj]
-				pred 			= torch.where(label.byte(), -torch.ones_like(pred) * 10000000, pred)
+				pred 			= torch.where(label.bool(), -torch.ones_like(pred) * 10000000, pred)
 				pred[b_range, obj] 	= target_pred
 				ranks			= 1 + torch.argsort(torch.argsort(pred, dim=1, descending=True), dim=1, descending=False)[b_range, obj]
 
@@ -463,8 +463,9 @@ class Runner(object):
 		-------
 		"""
 		self.best_val_mrr, self.best_val, self.best_epoch, val_mrr = 0., {}, 0, 0.
-		#save_path = os.path.join('./checkpoints', self.p.name)
-		save_path = os.path.join('./checkpoints','testrun_28_11_2023_12:32:03')
+		save_dir = os.path.join('./checkpoints', self.p.name)
+		os.makedirs(save_dir, exist_ok=True)
+		save_path = os.path.join(save_dir, 'model.pt')
 
 		if self.p.restore:
 			self.load_model(save_path)
@@ -560,3 +561,14 @@ if __name__ == '__main__':
 
 	model = Runner(args)
 	model.fit()
+
+
+"""python Utils/KG.py \
+  -name ucf_graphhd_transe \
+  -data UCF_Crime \
+  -model GrapHD \
+  -score_func transe \
+  -epoch 100 \
+  -batch 128 \
+  -lr 1e-3 \
+  -gpu 1"""

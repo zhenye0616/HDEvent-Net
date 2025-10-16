@@ -86,6 +86,33 @@ HDEvent-Net/
 
 ## Usage
 
+### End-to-End Pipeline
+
+The typical workflow processes manifests, segments, attribute scores, and finally produces the KG used for training. Run the following in order when the upstream artefacts change:
+
+1. **Select videos for each split** – `scripts/generate_split.sh`
+   - Filters the rich manifest into `Data/UCF_Crime/{train,val,test}.txt` based on class list and augmentation index.
+   - Re-run only when you adjust which videos belong to each split.
+
+2. **(Re)segment event streams** – `scripts/build_event_kg.sh`
+   - Invokes `Utils/precompute_segments.py` to write canonical segment JSONLs under `Data/segments/<split>/`.
+   - Also regenerates structural triples (class/part/precedes). Skip this step if the segmentation config and raw features have not changed.
+
+3. **Score attributes per segment** – `scripts/run_segments.sh`
+   - Calls `Utils/attribute_similarity.py` with temporal logits and writes per-segment attribute files to `Data/segment_attributes/<split>/`.
+   - Only needs rerunning when you change CLIP scoring parameters or regenerate segments.
+
+4. **Build KG triples (structure + attributes)** – `scripts/build_triples.sh --segment-attrs-root Data/segment_attributes`
+   - Reads the segment JSONLs and the corresponding attribute JSONLs to emit `has_attribute` edges alongside structural triples in `Data/UCF_Crime/{train,val,test}.txt`.
+
+5. **Rebuild ID mappings** – `python Utils/build_kg_indices.py ...`
+   - Refreshes `entity2id.txt` and `relation2id.txt` so every video/segment/attribute and the `has_attribute` relation receive deterministic IDs.
+
+6. **Train/evaluate** – `python Utils/KG.py ...`
+   - Loads the refreshed KG files and trains GrapHD/CompGCN variants.
+
+Use the smaller helpers (`build_triples.sh`, `run_attribute_segments.sh`) for incremental updates; the full `build_event_kg.sh` orchestration is convenient when you want to regenerate everything from scratch.
+
 ### Dataset Testing
 
 Debug and test the dataset loader:
@@ -123,6 +150,23 @@ python Utils/attribute_similarity.py \
   --use-logits \
   --max-samples 20
 ```
+
+To export the per-segment attribute scores that feed the KG, supply the segment-related flags:
+
+```bash
+python Utils/attribute_similarity.py /mnt/Data_1/UCFCrime_dataset \
+  --variant vitb \
+  --split event_thr_10 \
+  --checkpoint ckpt/vitb.pt \
+  --classes Abuse Arrest Arson \
+  --use-temporal --use-logits \
+  --segment-output-dir Data/segment_attributes \
+  --segments-root Data/segments \
+  --segments-split train \
+  --segment-top-k 5 --segment-aggregate max
+```
+
+`scripts/run_attribute_segments.sh` wraps this invocation with project defaults.
 
 **Using cosine similarity instead of CLIP logits:**
 ```bash

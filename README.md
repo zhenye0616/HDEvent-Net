@@ -216,7 +216,6 @@ python Utils/attribute_similarity.py \
 3. **Model Variants** (`Model/models.py`)
    - Base classes: `BaseModel`, `CompGCNBase`, `GrapHDBase`
    - GrapHD models: `GrapHD_DistMult`, `GrapHD_TransE`
-   - Quantization models: `GrapHD_Dist_Quant`, `GrapHD_Dist_Quant1`, `GrapHD_Dist_Quant2`, `GrapHD_Dist_EarlyDrop`
    - Legacy CompGCN models: `CompGCN_DistMult`, `CompGCN_TransE`, `CompGCN_ConvE`
 
 4. **Attribute Analysis** (`Utils/attribute_similarity.py`)
@@ -231,12 +230,6 @@ python Utils/attribute_similarity.py \
 2. Binding operation (mult/sub/corr) combines entity and relation in HD space
 3. Message passing aggregates neighbor information with graph normalization
 4. Output: entity embeddings `[num_ent, gcn_dim]` and relation embeddings `[num_rel, gcn_dim]`
-
-### Quantization Pipeline
-
-- `GrapHD_Dist_Quant`: Dynamic int8 quantization of final MLP layer
-- `GrapHD_Dist_Quant2`: Fixed-point quantization of HDVs with configurable bit widths
-- `GrapHD_Dist_EarlyDrop`: Dimension reduction by selecting high-entropy dimensions
 
 ## Event-CLIP Integration
 
@@ -259,7 +252,7 @@ HDEvent-Net/
 │   └── attributes.json         # Semantic attributes (10 classes × 20 attributes)
 ├── Model/
 │   ├── GrapHD.py               # Main hyperdimensional GNN layer
-│   ├── models.py               # Model variants (DistMult, TransE, quantized)
+│   ├── models.py               # Model variants (DistMult, TransE)
 │   ├── compgcn_conv.py         # Standard CompGCN convolution
 │   ├── compgcn_conv_basis.py   # Basis decomposition variant
 │   └── message_passing.py      # Core message passing framework

@@ -4,7 +4,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 
 ###############################################################################
@@ -50,6 +50,46 @@ class SegmentRecord:
     seg_name: str
     split: str
     video_name: str
+
+
+def _manifest_to_video_token(raw_name: str) -> Optional[str]:
+    """
+    Extract a canonical video token from a manifest line.
+
+    Manifest entries may come from older scripts that emit tab-delimited rows:
+    class<TAB>video_id<TAB>aug_idx<TAB>/abs/path/to/file.npy
+    We prefer to recover the on-disk path because it encodes the full hierarchy.
+    """
+    if not raw_name:
+        return None
+
+    if "\t" not in raw_name:
+        return raw_name.strip()
+
+    fields = [field.strip() for field in raw_name.split("\t")]
+    # Prefer the file path column if it exists.
+    if fields and fields[-1]:
+        path_str = fields[-1]
+        try:
+            path = Path(path_str)
+            stem = path.stem
+            parts = path.parts
+            # Expect .../<root>/<split>/<class>/<video>.npy; guard for short paths.
+            if len(parts) >= 4:
+                root, split, cls = parts[-4], parts[-3], parts[-2]
+                return f"{root}/{split}/{cls}/{stem}"
+            # Fallback: drop any leading slash and join remaining pieces.
+            return "/".join(part for part in parts if part)
+        except Exception:
+            return path_str
+
+    class_name = fields[0] if len(fields) > 0 else ""
+    video_id = fields[1] if len(fields) > 1 else ""
+    aug_idx = fields[2] if len(fields) > 2 else ""
+    if aug_idx:
+        video_id = f"{video_id}__{aug_idx}"
+    tokens = [token for token in (class_name, video_id) if token]
+    return "/".join(tokens) if tokens else None
 
 
 def canonical_video_entity(raw: str) -> str:
@@ -136,10 +176,13 @@ def build_entity_order(
     # Video entities: prefer those referenced in manifests, fall back to segment discovery.
     manifest_videos: Set[str] = set()
     for raw_name in iter_manifests(manifest_root, splits):
-        if raw_name.startswith("video:"):
-            manifest_videos.add(canonical_video_entity(raw_name))
+        token = _manifest_to_video_token(raw_name)
+        if not token:
+            continue
+        if token.startswith("video:"):
+            manifest_videos.add(canonical_video_entity(token))
         else:
-            manifest_videos.add(canonical_video_entity(f"video:{raw_name}"))
+            manifest_videos.add(canonical_video_entity(f"video:{token}"))
 
     segment_videos, segment_entities = collect_segments(segments_root)
 
@@ -197,13 +240,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--entity-output",
         type=Path,
-        default=Path("Data/entity2id.txt"),
+        default=Path("Data/UCF_Crime/entity2id.txt"),
         help="Output path for entity2id mapping.",
     )
     parser.add_argument(
         "--relation-output",
         type=Path,
-        default=Path("Data/relation2id.txt"),
+        default=Path("Data/UCF_Crime/relation2id.txt"),
         help="Output path for relation2id mapping.",
     )
     parser.add_argument(
@@ -229,7 +272,7 @@ def main() -> None:
     write_mapping(entity_entries, args.entity_output)
     logger.info("Wrote entity mapping to %s", args.entity_output)
 
-    relations = ["has_attributes", "part_of", "precedes", "class_of"]
+    relations = ["has_attribute", "part_of", "precedes", "class_of"]
     relation_entries = build_relation_order(relations)
     write_mapping(relation_entries, args.relation_output)
     logger.info("Wrote relation mapping to %s", args.relation_output)

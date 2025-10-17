@@ -5,6 +5,7 @@ sys.path.append('./')
 from Model.models import *
 from copy import deepcopy
 import tqdm as tqdm
+import logging
 
 
 class Runner(object):
@@ -64,6 +65,8 @@ class Runner(object):
 					sr2o[(sub, rel)].add(obj)
 					sr2o[(obj, rel+self.p.num_rel)].add(sub)
 
+			self.logger.debug('[load_data] %s triples=%d', split, len(self.data[split]))
+
 		self.data = dict(self.data)
 
 		self.sr2o = {k: list(v) for k, v in sr2o.items()}
@@ -85,6 +88,11 @@ class Runner(object):
 				self.triples['{}_{}'.format(split, 'head')].append({'triple': (obj, rel_inv, sub), 'label': self.sr2o_all[(obj, rel_inv)]})
 
 		self.triples = dict(self.triples)
+		self.logger.debug('[load_data] train pairs=%d val_pairs=%d test_pairs=%d',
+			len(self.triples.get('train', [])),
+			len(self.triples.get('val_tail', [])),
+			len(self.triples.get('test_tail', []))
+		)
 
 		def get_data_loader(dataset_class, split, batch_size, shuffle=True):
 			return  DataLoader(
@@ -104,6 +112,12 @@ class Runner(object):
 		}
 
 		self.edge_index, self.edge_type = self.construct_adj()
+		self.logger.debug(
+			'[load_data] num_ent=%d num_rel=%d total_relations=%d',
+			self.p.num_ent,
+			self.p.num_rel,
+			len(self.rel2id)
+		)
 
 	def construct_adj(self):
 		"""
@@ -146,7 +160,10 @@ class Runner(object):
 		
 		"""
 		self.p			= params
+		self.p.debug		= getattr(self.p, 'debug', False)
 		self.logger		= get_logger(self.p.name, self.p.log_dir, self.p.config_dir)
+		if self.p.debug:
+			self.logger.setLevel(logging.DEBUG)
 
 		self.logger.info(vars(self.p))
 		pprint(vars(self.p))
@@ -272,7 +289,7 @@ class Runner(object):
 		self.model.load_state_dict(state_dict)
 		self.optimizer.load_state_dict(state['optimizer'])
 
-	def evaluate(self, split, epoch, quant_model=None):
+	def evaluate(self, split, epoch):
 		"""
 		Function to evaluate the model on validation or test set
 
@@ -289,80 +306,16 @@ class Runner(object):
 			results['hits@k']:      Probability of getting the correct preodiction in top-k ranks based on predicted score
 
 		"""
-		#NOTE: Hanning, HPCA 2024, reviewer 1
-		#NOTE: Hanning, ASPLOS 2024, adding quant module
-		if split == 'test':
-			quant_model = GrapHD_Dist_EarlyDrop(self.p)
-		
-		left_results  = self.predict(split=split, mode='tail_batch',quant_model=quant_model)
-		right_results = self.predict(split=split, mode='head_batch', quant_model=quant_model)
+		left_results  = self.predict(split=split, mode='tail_batch')
+		right_results = self.predict(split=split, mode='head_batch')
 		results       = get_combined_results(left_results, right_results)
 		
 		self.logger.info('[Epoch {} {}]: MRR: Tail : {:.5}, Head : {:.5}, Avg : {:.5}'.format(epoch, split, results['left_mrr'], results['right_mrr'], results['mrr']))
 		self.logger.info('=========================')
 		self.logger.info('[Epoch {} {}]: @10: {:.5}, @3: {:.5}, @1:{:.5}'.format(epoch, split, results['hits@10'], results['hits@3'], results['hits@1']))
 		self.logger.info('=========================')
-		
-		"""
-		if split == 'test':
-			for i in range(2,17):
-				for j in range(1,i):
-					#NOTE: Hanning, ASPLOS, try quantized result
-					# quant_model_8bit = torch.ao.quantization.quantize_dynamic(quant_model,qconfig_dict,dtype=torch.qint8)
-					N_fix = i
-					N_frac = j
-					left_results  = self.quant_predict(split=split, mode='tail_batch',quant_model=quant_model,N_fix=N_fix,N_frac=N_frac)
-					right_results = self.quant_predict(split=split, mode='head_batch', quant_model=quant_model,N_fix=N_fix,N_frac=N_frac)
-					results       = get_combined_results(left_results, right_results)
-					self.logger.info('=========================')
-					self.logger.info('Fixed point {} bits, fraction {} bits, Model {}'.format(i,j,self.p.model))
-					self.logger.info('[Quant Result Epoch {} {}]: MRR: Tail : {:.5}, Head : {:.5}, Avg : {:.5}'.format(epoch, split, results['left_mrr'], results['right_mrr'], results['mrr']))
-					self.logger.info('[Quant Result Epoch {} {}]: @10: {:.5}, @3: {:.5}, @1:{:.5}'.format(epoch, split, results['hits@10'], results['hits@3'], results['hits@1']))
-					self.logger.info('=========================')
-		"""
-		if split == 'test':
-			#NOTE: Hanning, ASPLOS, try quantized result
-			for d_select in range(32,self.p.gcn_dim,32):
-				left_results  = self.quant_predict(split=split, mode='tail_batch',quant_model=quant_model,N_fix=-1,N_frac=-1,d_select=d_select)
-				right_results = self.quant_predict(split=split, mode='head_batch', quant_model=quant_model,N_fix=-1,N_frac=-1,d_select=d_select)
-				results       = get_combined_results(left_results, right_results)
-				self.logger.info('=========================')
-				self.logger.info('The select dimension is {}, Model {}'.format(d_select,self.p.model))
-				self.logger.info('[Quant Result Epoch {} {}]: MRR: Tail : {:.5}, Head : {:.5}, Avg : {:.5}'.format(epoch, split, results['left_mrr'], results['right_mrr'], results['mrr']))
-				self.logger.info('[Quant Result Epoch {} {}]: @10: {:.5}, @3: {:.5}, @1:{:.5}'.format(epoch, split, results['hits@10'], results['hits@3'], results['hits@1']))
-				self.logger.info('=========================')
 		return results
-
-	def quant_predict(self, split='test', mode='tail_batch', quant_model=None,N_fix=-1,N_frac=-1,d_select=-1):
-		model_q = quant_model
-		model_q.eval()
-		with torch.no_grad():
-			results = {}
-			train_iter = iter(self.data_iter['{}_{}'.format(split, mode.split('_')[0])])
-
-			for step, batch in enumerate(train_iter):
-				sub, rel, obj, label	= self.read_batch(batch, split)
-				pred			= model_q.forward(sub, rel,N_fix,N_frac,d_select)
-				pred = pred.cuda()
-				b_range			= torch.arange(pred.size()[0], device=self.device)
-				target_pred		= pred[b_range, obj]
-				pred 			= torch.where(label.bool(), (-torch.ones_like(pred) * 10000000), pred)
-				pred[b_range, obj] 	= target_pred
-				ranks			= 1 + torch.argsort(torch.argsort(pred, dim=1, descending=True), dim=1, descending=False)[b_range, obj]
-
-				ranks 			= ranks.float()
-				results['count']	= torch.numel(ranks) 		+ results.get('count', 0.0)
-				results['mr']		= torch.sum(ranks).item() 	+ results.get('mr',    0.0)
-				results['mrr']		= torch.sum(1.0/ranks).item()   + results.get('mrr',   0.0)
-				for k in range(10):
-					results['hits@{}'.format(k+1)] = torch.numel(ranks[ranks <= (k+1)]) + results.get('hits@{}'.format(k+1), 0.0)
-
-				if step % 100 == 0:
-					self.logger.info('[{}, {} Step {}]\t{}'.format(split.title(), mode.title(), step, self.p.name))
-
-		return results
-
-	def predict(self, split='val', mode='tail_batch', quant_model=None):
+	def predict(self, split='val', mode='tail_batch'):
 		"""
 		Function to run model evaluation for a given mode
 
@@ -434,6 +387,18 @@ class Runner(object):
 			loss	= self.model.loss(pred, label)
 			loss.backward()
 			self.optimizer.step()
+
+			if self.logger.isEnabledFor(logging.DEBUG):
+				mean_pos = label.sum(dim=1).mean().item()
+				self.logger.debug(
+					'[train] epoch=%d step=%d loss=%.6f mean_pos=%.3f sub[0]=%d rel[0]=%d',
+					epoch,
+					step,
+					loss.item(),
+					mean_pos,
+					sub[0].item(),
+					rel[0].item()
+				)
 
 			torch.cuda.synchronize()
 			end_epoch = time.time()
@@ -509,7 +474,7 @@ class Runner(object):
 		# 		print("Flip {}".format(name))
 		# 		random_bit_flip_by_prob(param, noise_prob)
 
-		test_results = self.evaluate('test', epoch,quant_model=None)
+		test_results = self.evaluate('test', epoch)
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Parser For Arguments', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -566,9 +531,10 @@ if __name__ == '__main__':
 """python Utils/KG.py \
   -name ucf_graphhd_transe \
   -data UCF_Crime \
-  -model GrapHD \
+  -model compgcn \
   -score_func transe \
   -epoch 100 \
   -batch 128 \
   -lr 1e-3 \
-  -gpu 1"""
+  -gpu 1
+  -debug"""

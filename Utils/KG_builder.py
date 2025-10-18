@@ -1,5 +1,6 @@
 import argparse
 import json
+import random
 import re
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
@@ -141,17 +142,77 @@ def _iter_structure_triples(
         yield (prev_seg, "precedes", next_seg)
 
 
+def _split_attribute_triples(
+    triples: List[Tuple[str, str, str]],
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+) -> Tuple[List[Tuple[str, str, str]], List[Tuple[str, str, str]], List[Tuple[str, str, str]]]:
+    """
+    Split attribute triples into train/val/test while ensuring every segment keeps at least one
+    attribute edge in the training split to anchor its embedding.
+    """
+    total = len(triples)
+    if total == 0:
+        return [], [], []
+
+    if abs((train_ratio + val_ratio + test_ratio) - 1.0) > 1e-6:
+        raise ValueError("Attribute split ratios must sum to 1.0")
+
+    rng = random.Random(seed)
+
+    mandatory_train: Dict[str, Tuple[str, str, str]] = {}
+    remaining: List[Tuple[str, str, str]] = []
+    for triple in triples:
+        seg = triple[0]
+        if seg not in mandatory_train:
+            mandatory_train[seg] = triple
+        else:
+            remaining.append(triple)
+
+    train_triples: List[Tuple[str, str, str]] = list(mandatory_train.values())
+    rng.shuffle(remaining)
+
+    target_train = max(len(train_triples), int(round(train_ratio * total)))
+    target_train = min(total, target_train)
+
+    remaining_capacity = total - target_train
+    target_val = int(round(val_ratio * total))
+    target_val = min(remaining_capacity, target_val)
+
+    extra_train_needed = max(0, target_train - len(train_triples))
+    extra_train_take = min(len(remaining), extra_train_needed)
+    if extra_train_take:
+        train_triples.extend(remaining[:extra_train_take])
+        remaining = remaining[extra_train_take:]
+
+    val_triples = remaining[:target_val]
+    remaining = remaining[target_val:]
+
+    test_triples = remaining
+
+    return train_triples, val_triples, test_triples
+
+
 def build_triple_files(
     segments_root: Path,
     manifest_root: Path,
     output_root: Path,
     splits: Iterable[str] = ("train", "val", "test"),
     segment_attrs_root: Optional[Path] = None,
+    attr_train_ratio: float = 0.8,
+    attr_val_ratio: float = 0.1,
+    attr_test_ratio: float = 0.1,
+    split_seed: int = 42,
 ) -> None:
     segments_root = Path(segments_root)
     manifest_root = Path(manifest_root)
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+
+    structural_triples: List[Tuple[str, str, str]] = []
+    attribute_triples: List[Tuple[str, str, str]] = []
 
     for split in splits:
         segments_by_video = _load_segments_for_split(segments_root, split)
@@ -196,7 +257,7 @@ def build_triple_files(
             attr_class_cache: Optional[str] = None
             for triple in _iter_structure_triples(video_entity, segments):
                 sub, rel, obj = (triple[0].lower(), triple[1].lower(), triple[2].lower())
-                lines.append("\t".join((sub, rel, obj)))
+                structural_triples.append((sub, rel, obj))
             if attr_records:
                 for segment in segments:
                     if segment in attr_records:
@@ -212,12 +273,27 @@ def build_triple_files(
                                 continue
                             attr_slug = _slugify(attr_name)
                             attr_entity = f"attribute:{class_slug}:{attr_slug}"
-                            lines.append("\t".join((segment, "has_attribute", attr_entity)))
+                            attribute_triples.append(
+                                (segment.lower(), "has_attribute", attr_entity.lower())
+                            )
 
-        out_path = output_root / f"{split}.txt"
+    train_attr, val_attr, test_attr = _split_attribute_triples(
+        attribute_triples,
+        attr_train_ratio,
+        attr_val_ratio,
+        attr_test_ratio,
+        split_seed,
+    )
+
+    train_lines = structural_triples + train_attr
+    val_lines = val_attr
+    test_lines = test_attr
+
+    for split_name, split_lines in (("train", train_lines), ("val", val_lines), ("test", test_lines)):
+        out_path = output_root / f"{split_name}.txt"
         with out_path.open("w", encoding="utf-8") as handle:
-            for line in lines:
-                handle.write(f"{line}\n")
+            for sub, rel, obj in split_lines:
+                handle.write(f"{sub}\t{rel}\t{obj}\n")
 
 
 def _build_triples_cli(args: argparse.Namespace) -> None:
@@ -227,6 +303,10 @@ def _build_triples_cli(args: argparse.Namespace) -> None:
         output_root=args.output_root,
         splits=args.splits,
         segment_attrs_root=args.segment_attrs_root,
+        attr_train_ratio=args.attr_split[0],
+        attr_val_ratio=args.attr_split[1],
+        attr_test_ratio=args.attr_split[2],
+        split_seed=args.split_seed,
     )
 
 
@@ -266,6 +346,20 @@ def _parse_cli_arguments() -> argparse.Namespace:
         nargs="*",
         default=("train", "val", "test"),
         help="Dataset splits to process.",
+    )
+    build_parser.add_argument(
+        "--attr-split",
+        nargs=3,
+        type=float,
+        metavar=("TRAIN", "VAL", "TEST"),
+        default=(0.8, 0.1, 0.1),
+        help="Ratios for splitting has_attribute triples into train/val/test.",
+    )
+    build_parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help="Random seed for attribute triple splitting.",
     )
 
     return parser.parse_args()

@@ -1,7 +1,7 @@
-from KG_helper import *
-from data_loader import *
 import sys
 sys.path.append('./')
+from Utils.KG_helper import *
+from Utils.data_loader import *
 from Model.models import *
 from copy import deepcopy
 import tqdm as tqdm
@@ -528,10 +528,10 @@ if __name__ == '__main__':
 	model.fit()
 
 
-"""python Utils/KG.py \
+"""python KG.py \
   -name ucf_graphhd_transe \
   -data UCF_Crime \
-  -model compgcn \
+  -model graphd \
   -score_func transe \
   -epoch 100 \
   -batch 128 \

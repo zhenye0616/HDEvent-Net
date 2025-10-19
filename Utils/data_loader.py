@@ -1,4 +1,4 @@
-from KG_helper import *
+from .KG_helper import *
 from torch.utils.data import Dataset
 
 class TrainDataset(Dataset):

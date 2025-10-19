@@ -108,7 +108,7 @@ The typical workflow processes manifests, segments, attribute scores, and finall
 5. **Rebuild ID mappings** – `python Utils/build_kg_indices.py ...`
    - Refreshes `entity2id.txt` and `relation2id.txt` so every video/segment/attribute and the `has_attribute` relation receive deterministic IDs.
 
-6. **Train/evaluate** – `python Utils/KG.py ...`
+6. **Train/evaluate** – `python KG.py ...`
    - Loads the refreshed KG files and trains GrapHD/CompGCN variants.
 
 Use the smaller helpers (`build_triples.sh`, `run_attribute_segments.sh`) for incremental updates; the full `build_event_kg.sh` orchestration is convenient when you want to regenerate everything from scratch.

@@ -48,7 +48,7 @@ def iter_manifests(manifest_root: Path, splits: Iterable[str]) -> Iterable[str]:
 @dataclass(frozen=True)
 class SegmentRecord:
     seg_name: str
-    split: str
+    split: Optional[str]
     video_name: str
 
 
@@ -99,28 +99,41 @@ def canonical_video_entity(raw: str) -> str:
     token = token.replace("\\", "/")
     token = token.replace(":", "/")
     token = token.strip("/")
+    parts = token.split("/")
+    if parts and parts[0].lower() in {"train", "val", "test"}:
+        token = "/".join(parts[1:])
     return f"video:{token.lower()}"
 
 
 def parse_segment_name(seg_name: str) -> SegmentRecord:
     """
-    Parse seg:<split>/<canonical_video>:<idx> → SegmentRecord.
+    Parse a raw segment token into canonical identifiers.
     """
     if not seg_name.startswith("seg:"):
         raise ValueError(f"Unexpected segment name: {seg_name}")
-    payload = seg_name[len("seg:") :]
+    payload = seg_name[len("seg:") :].replace("\\", "/").strip("/")
     try:
-        video_path, _ = payload.rsplit(":", 1)
+        video_path_with_split, seg_index = payload.rsplit(":", 1)
     except ValueError as exc:
         raise ValueError(f"Segment name missing index: {seg_name}") from exc
 
-    try:
-        split, rest = video_path.split("/", 1)
-    except ValueError as exc:
-        raise ValueError(f"Segment name missing split: {seg_name}") from exc
+    video_path_with_split = video_path_with_split.strip("/")
+    split_token: Optional[str] = None
+    video_path = video_path_with_split
+    if "/" in video_path_with_split:
+        candidate_split, remainder = video_path_with_split.split("/", 1)
+        candidate_lower = candidate_split.lower()
+        if candidate_lower in {"train", "val", "test"}:
+            split_token = candidate_lower
+            video_path = remainder
+        else:
+            video_path = video_path_with_split
+    video_name = canonical_video_entity(f"video:{video_path}")
+    segment_suffix = video_name[len("video:") :]
+    seg_index = seg_index.strip().lower()
+    canonical_segment = f"seg:{segment_suffix}:{seg_index}"
 
-    video_name = canonical_video_entity(f"video:{rest}")
-    return SegmentRecord(seg_name=seg_name, split=split, video_name=video_name)
+    return SegmentRecord(seg_name=canonical_segment, split=split_token, video_name=video_name)
 
 
 def collect_segments(segments_root: Path) -> Tuple[Set[str], Set[str]]:
@@ -145,7 +158,7 @@ def collect_segments(segments_root: Path) -> Tuple[Set[str], Set[str]]:
                         continue
                     parsed = parse_segment_name(seg_name)
                     video_entities.add(parsed.video_name)
-                    segment_entities.add(seg_name.lower())
+                    segment_entities.add(parsed.seg_name)
 
     return video_entities, segment_entities
 
@@ -272,7 +285,7 @@ def main() -> None:
     write_mapping(entity_entries, args.entity_output)
     logger.info("Wrote entity mapping to %s", args.entity_output)
 
-    relations = ["has_attribute", "part_of", "precedes", "class_of"]
+    relations = ["has_attribute", "part_of", "precedes", "class_of", "in_split"]
     relation_entries = build_relation_order(relations)
     write_mapping(relation_entries, args.relation_output)
     logger.info("Wrote relation mapping to %s", args.relation_output)

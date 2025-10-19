@@ -3,7 +3,7 @@ import json
 import random
 import re
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 
 def _slugify(text: str) -> str:
@@ -17,31 +17,74 @@ def canonical_video_entity(raw_name: str) -> str:
     token = token.replace("\\", "/")
     token = token.replace(":", "/")
     token = token.strip("/")
+    parts = token.split("/")
+    if parts and parts[0].lower() in {"train", "val", "test"}:
+        token = "/".join(parts[1:])
     return f"video:{token.lower()}"
 
 
+def _parse_segment_name(seg_name: str, *, require_split: bool = False) -> Tuple[str, str, Optional[str]]:
+    """
+    Canonicalize a raw segment token.
+
+    Returns
+    -------
+    segment_entity: str
+        Canonical segment identifier (no split prefix).
+    video_entity: str
+        Parent video entity identifier.
+    split: str
+        Split token (train/val/test/...).
+    """
+    token = seg_name.strip()
+    if not token.startswith("seg:"):
+        raise ValueError(f"Unexpected segment name: {seg_name}")
+
+    payload = token[len("seg:") :].replace("\\", "/").strip("/")
+    try:
+        video_path_with_split, seg_index = payload.rsplit(":", 1)
+    except ValueError as exc:
+        raise ValueError(f"Segment name missing index: {seg_name}") from exc
+
+    video_path_with_split = video_path_with_split.strip("/")
+    split_token: Optional[str]
+    if "/" not in video_path_with_split:
+        if require_split:
+            raise ValueError(f"Segment name missing split: {seg_name}")
+        split_token = None
+        video_path = video_path_with_split
+    else:
+        candidate_split, remainder = video_path_with_split.split("/", 1)
+        candidate_lower = candidate_split.lower()
+        if candidate_lower in {"train", "val", "test"}:
+            split_token = candidate_lower
+            video_path = remainder
+        elif require_split:
+            raise ValueError(f"Segment name missing split: {seg_name}")
+        else:
+            split_token = None
+            video_path = video_path_with_split
+    video_entity = canonical_video_entity(f"video:{video_path}")
+    segment_suffix = video_entity[len("video:") :]
+    seg_index = seg_index.strip().lower()
+    segment_entity = f"seg:{segment_suffix}:{seg_index}"
+    return segment_entity, video_entity, split_token
+
+
 def canonical_segment_entity(seg_name: str) -> str:
-    return seg_name.strip().lower()
+    segment_entity, _, _ = _parse_segment_name(seg_name)
+    return segment_entity
 
 
 def _segment_to_video(seg_name: str) -> str:
-    if not seg_name.startswith("seg:"):
-        raise ValueError(f"Unexpected segment name: {seg_name}")
-    payload = seg_name[len("seg:") :]
-    try:
-        video_path, _ = payload.rsplit(":", 1)
-    except ValueError as exc:
-        raise ValueError(f"Segment name missing index: {seg_name}") from exc
-    try:
-        _, rest = video_path.split("/", 1)
-    except ValueError as exc:
-        raise ValueError(f"Segment name missing split: {seg_name}") from exc
-    return canonical_video_entity(f"video:{rest}")
+    _, video_entity, _ = _parse_segment_name(seg_name)
+    return video_entity
 
 
 def _load_segments_for_split(segments_root: Path, split: str) -> Dict[str, List[str]]:
     segments_by_video: Dict[str, List[str]] = {}
-    split_dir = segments_root / split
+    split_key = split.lower()
+    split_dir = segments_root / split_key
     if not split_dir.exists():
         return segments_by_video
 
@@ -55,10 +98,14 @@ def _load_segments_for_split(segments_root: Path, split: str) -> Dict[str, List[
                 seg_name = record.get("seg_name")
                 if not seg_name:
                     continue
-                video_entity = _segment_to_video(seg_name)
-                segments_by_video.setdefault(video_entity, []).append(
-                    canonical_segment_entity(seg_name)
+                segment_entity, video_entity, segment_split = _parse_segment_name(
+                    seg_name, require_split=True
                 )
+                if segment_split != split_key:
+                    raise ValueError(
+                        f"Segment split mismatch for {seg_name}: expected {split_key}, found {segment_split}"
+                    )
+                segments_by_video.setdefault(video_entity, []).append(segment_entity)
 
     for video_entity, seg_list in segments_by_video.items():
         seg_list.sort()
@@ -80,7 +127,11 @@ def load_segment_attributes(path: Path) -> Dict[str, List[Dict[str, float]]]:
             seg_name = record.get("segment")
             attrs = record.get("top_attributes", [])
             if seg_name:
-                segment_to_attrs[seg_name.strip().lower()] = attrs
+                try:
+                    segment_entity, _, _ = _parse_segment_name(seg_name)
+                except ValueError:
+                    continue
+                segment_to_attrs[segment_entity] = attrs
     return segment_to_attrs
 
 
@@ -96,11 +147,15 @@ def sanitize_video_filename(video_entity: str) -> str:
 def segment_class_from_name(segment_name: str) -> Optional[str]:
     if not segment_name.startswith("seg:"):
         return None
-    payload = segment_name[len("seg:") :]
-    parts = payload.split("/")
-    if len(parts) < 4:
+    try:
+        _, video_entity, _ = _parse_segment_name(segment_name)
+    except ValueError:
         return None
-    return parts[3]
+    video_payload = video_entity[len("video:") :]
+    parts = video_payload.split("/")
+    if len(parts) < 3:
+        return None
+    return parts[2]
 
 
 def _load_manifest_videos(manifest_root: Path, split: str) -> List[str]:
@@ -113,9 +168,11 @@ def _load_manifest_videos(manifest_root: Path, split: str) -> List[str]:
             line = line.strip()
             if not line:
                 continue
-            videos.append(
-                canonical_video_entity(line if line.startswith("video:") else f"video:{line}")
-            )
+            token = line.split()[0]
+            if token.startswith("seg:"):
+                continue
+            normalized = token if token.startswith("video:") else f"video:{token}"
+            videos.append(canonical_video_entity(normalized))
     return videos
 
 
@@ -211,21 +268,26 @@ def build_triple_files(
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    structural_triples: List[Tuple[str, str, str]] = []
+    structural_triples: Set[Tuple[str, str, str]] = set()
     attribute_triples: List[Tuple[str, str, str]] = []
+    video_splits: Dict[str, Set[str]] = {}
+    segment_splits: Dict[str, Set[str]] = {}
 
     for split in splits:
-        segments_by_video = _load_segments_for_split(segments_root, split)
-        manifest_videos = _load_manifest_videos(manifest_root, split)
+        split_key = split.lower()
+        segments_by_video = _load_segments_for_split(segments_root, split_key)
+        manifest_videos = _load_manifest_videos(manifest_root, split_key)
+
+        for video_entity in manifest_videos:
+            video_splits.setdefault(video_entity, set()).add(split_key)
 
         all_videos = sorted(set(segments_by_video.keys()) | set(manifest_videos))
         if not all_videos:
             continue
 
-        lines: List[str] = []
         attrs_lookup: Dict[str, Dict[str, List[Dict[str, float]]]] = {}
         if segment_attrs_root is not None:
-            attrs_dir = Path(segment_attrs_root) / split
+            attrs_dir = Path(segment_attrs_root) / split_key
             if attrs_dir.exists():
                 for attr_path in attrs_dir.glob("*.jsonl"):
                     records = load_segment_attributes(attr_path)
@@ -249,6 +311,7 @@ def build_triple_files(
                     attrs_lookup[canonical_name] = records
         for video_entity in all_videos:
             segments = segments_by_video.get(video_entity, [])
+            video_splits.setdefault(video_entity, set()).add(split_key)
             if not segments:
                 continue
             attr_records: Dict[str, List[Dict[str, float]]] = {}
@@ -257,25 +320,33 @@ def build_triple_files(
             attr_class_cache: Optional[str] = None
             for triple in _iter_structure_triples(video_entity, segments):
                 sub, rel, obj = (triple[0].lower(), triple[1].lower(), triple[2].lower())
-                structural_triples.append((sub, rel, obj))
-            if attr_records:
-                for segment in segments:
-                    if segment in attr_records:
-                        if attr_class_cache is None:
-                            class_name = segment_class_from_name(segment)
-                            attr_class_cache = _slugify(class_name) if class_name else None
-                        class_slug = attr_class_cache
-                        if not class_slug:
+                structural_triples.add((sub, rel, obj))
+            for segment in segments:
+                segment_splits.setdefault(segment, set()).add(split_key)
+                if attr_records and segment in attr_records:
+                    if attr_class_cache is None:
+                        class_name = segment_class_from_name(segment)
+                        attr_class_cache = _slugify(class_name) if class_name else None
+                    class_slug = attr_class_cache
+                    if not class_slug:
+                        continue
+                    for attr in attr_records[segment]:
+                        attr_name = attr.get("name")
+                        if not attr_name:
                             continue
-                        for attr in attr_records[segment]:
-                            attr_name = attr.get("name")
-                            if not attr_name:
-                                continue
-                            attr_slug = _slugify(attr_name)
-                            attr_entity = f"attribute:{class_slug}:{attr_slug}"
-                            attribute_triples.append(
-                                (segment.lower(), "has_attribute", attr_entity.lower())
-                            )
+                        attr_slug = _slugify(attr_name)
+                        attr_entity = f"attribute:{class_slug}:{attr_slug}"
+                        attribute_triples.append(
+                            (segment.lower(), "has_attribute", attr_entity.lower())
+                        )
+
+    for video_entity, splits_membership in video_splits.items():
+        for split_name in sorted(splits_membership):
+            structural_triples.add((video_entity, "in_split", f"split:{split_name}"))
+
+    for segment_entity, splits_membership in segment_splits.items():
+        for split_name in sorted(splits_membership):
+            structural_triples.add((segment_entity, "in_split", f"split:{split_name}"))
 
     train_attr, val_attr, test_attr = _split_attribute_triples(
         attribute_triples,
@@ -285,9 +356,14 @@ def build_triple_files(
         split_seed,
     )
 
-    train_lines = structural_triples + train_attr
-    val_lines = val_attr
-    test_lines = test_attr
+    structural_trip_list = sorted(structural_triples)
+    train_attr_sorted = sorted(train_attr)
+    val_attr_sorted = sorted(val_attr)
+    test_attr_sorted = sorted(test_attr)
+
+    train_lines = structural_trip_list + train_attr_sorted
+    val_lines = val_attr_sorted
+    test_lines = test_attr_sorted
 
     for split_name, split_lines in (("train", train_lines), ("val", val_lines), ("test", test_lines)):
         out_path = output_root / f"{split_name}.txt"

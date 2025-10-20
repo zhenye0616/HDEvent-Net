@@ -164,6 +164,12 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Relations to treat as temporal and exclude from the optional filtered stats.",
     )
+    parser.add_argument(
+        "--denylist",
+        nargs="*",
+        default=[],
+        help="Relations to exclude when computing the filtered diagnostics block.",
+    )
     return parser.parse_args()
 
 
@@ -221,6 +227,49 @@ def main() -> None:
         degree_filtered = compute_degrees(filtered)
         for key, value in describe_degree(degree_filtered).items():
             print(f"{key}: {value}")
+
+    if args.denylist:
+        deny = set(args.denylist)
+        filtered_train = [tr for tr in train if tr[1] not in deny]
+        filtered_val = [tr for tr in val if tr[1] not in deny]
+        filtered_test = [tr for tr in test if tr[1] not in deny]
+        filtered_all = filtered_train + filtered_val + filtered_test
+
+        print("\n=== Filtered Triple Counts (denylist) ===")
+        print(
+            f"train: {len(filtered_train)}  val: {len(filtered_val)}  test: {len(filtered_test)}  total: {len(filtered_all)}"
+        )
+
+        print("\n=== Filtered Degree Statistics ===")
+        filtered_degree = compute_degrees(filtered_all)
+        for key, value in describe_degree(filtered_degree).items():
+            print(f"{key}: {value}")
+
+        print("\n=== Filtered Relation Frequency ===")
+        filtered_rel_counter, filtered_entropy = relation_statistics(filtered_all)
+        for rel, count in filtered_rel_counter.most_common():
+            print(f"{rel}: {count}")
+        print(f"entropy(bits): {filtered_entropy:.4f}")
+
+        print("\n=== Filtered Relation Fan-out (avg tails/head & heads/tail) ===")
+        filtered_fanout = compute_fanout(filtered_all)
+        for rel, stats in filtered_fanout.items():
+            print(
+                f"{rel}: tails/head={stats['avg_tails_per_head']:.2f}, heads/tail={stats['avg_heads_per_tail']:.2f}"
+            )
+
+        print("\n=== Filtered Component Statistics ===")
+        filtered_comp = component_stats(filtered_all)
+        for key, value in filtered_comp.items():
+            print(f"{key}: {value}")
+
+        print("\n=== Filtered Split Coverage (val/test vs train) ===")
+        filtered_train_set = set(filtered_train)
+        filtered_cov_val = split_coverage(filtered_train_set, filtered_val)
+        filtered_cov_test = split_coverage(filtered_train_set, filtered_test)
+        print(f"val: {filtered_cov_val}")
+        print(f"test: {filtered_cov_test}")
+
 
 
 if __name__ == "__main__":

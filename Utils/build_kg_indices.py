@@ -285,7 +285,7 @@ def main() -> None:
     write_mapping(entity_entries, args.entity_output)
     logger.info("Wrote entity mapping to %s", args.entity_output)
 
-    relations = ["has_attribute", "part_of", "precedes", "class_of", "in_split"]
+    relations = ["has_attribute", "part_of", "class_of"]
     relation_entries = build_relation_order(relations)
     write_mapping(relation_entries, args.relation_output)
     logger.info("Wrote relation mapping to %s", args.relation_output)

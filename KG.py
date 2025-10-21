@@ -108,6 +108,8 @@ class Runner(object):
 			len(self.triples.get('test_tail', []))
 		)
 
+		self._init_type_masks()
+
 		def get_data_loader(dataset_class, split, batch_size, shuffle=True):
 			return  DataLoader(
 					dataset_class(self.triples[split], self.p),
@@ -326,6 +328,59 @@ class Runner(object):
 		self.logger.info('[Epoch {} {}]: @10: {:.5}, @3: {:.5}, @1:{:.5}'.format(epoch, split, results['hits@10'], results['hits@3'], results['hits@1']))
 		self.logger.info('=========================')
 		return results
+
+	def _init_type_masks(self):
+		type_buckets = {
+			'segment': [],
+			'video': [],
+			'class': [],
+			'attribute': [],
+		}
+		for ent, idx in self.ent2id.items():
+			if ent.startswith('seg:'):
+				type_buckets['segment'].append(idx)
+			elif ent.startswith('video:'):
+				type_buckets['video'].append(idx)
+			elif ent.startswith('class:'):
+				type_buckets['class'].append(idx)
+			elif ent.startswith('attribute:'):
+				type_buckets['attribute'].append(idx)
+
+		self._type_index_tensors = {}
+		for key, vals in type_buckets.items():
+			if vals:
+				self._type_index_tensors[key] = torch.tensor(vals, dtype=torch.long, device=self.device)
+			else:
+				self._type_index_tensors[key] = torch.empty(0, dtype=torch.long, device=self.device)
+
+		total_rels = len(self.rel2id)
+		mask_tensor = torch.ones(total_rels, self.p.num_ent, dtype=torch.float32, device=self.device)
+
+		for rel_name, rel_id in self.rel2id.items():
+			if rel_name.endswith('_reverse'):
+				base = rel_name[:-8]
+				is_reverse = True
+			else:
+				base = rel_name
+				is_reverse = False
+
+			allowed_indices = None
+			if base == 'class_of':
+				allowed_indices = self._type_index_tensors['video'] if is_reverse else self._type_index_tensors['class']
+			elif base == 'part_of':
+				allowed_indices = self._type_index_tensors['segment'] if is_reverse else self._type_index_tensors['video']
+			elif base == 'has_attribute':
+				allowed_indices = self._type_index_tensors['segment'] if is_reverse else self._type_index_tensors['attribute']
+
+			if allowed_indices is not None and allowed_indices.numel() > 0:
+				mask_tensor[rel_id].zero_()
+				mask_tensor[rel_id].scatter_(0, allowed_indices, 1.0)
+
+		self.tail_type_mask = mask_tensor
+
+	def _get_tail_mask(self, rel_ids: torch.Tensor) -> torch.Tensor:
+		return self.tail_type_mask.index_select(0, rel_ids)
+
 	def predict(self, split='val', mode='tail_batch'):
 		"""
 		Function to run model evaluation for a given mode
@@ -352,6 +407,9 @@ class Runner(object):
 			for step, batch in enumerate(train_iter):
 				sub, rel, obj, label	= self.read_batch(batch, split)
 				pred		= self.model.forward(sub, rel)
+				mask		= self._get_tail_mask(rel)
+				label		= label * mask
+				pred		= pred.masked_fill(mask == 0, -1e6)
 				b_range			= torch.arange(pred.size()[0], device=self.device)
 				target_pred		= pred[b_range, obj]
 				pred 			= torch.where(label.bool(), -torch.ones_like(pred) * 10000000, pred)
@@ -395,6 +453,9 @@ class Runner(object):
 			self.optimizer.zero_grad()
 			sub, rel, obj, label = self.read_batch(batch, 'train')
 			pred	= self.model.forward(sub, rel)
+			mask    = self._get_tail_mask(rel)
+			label   = label * mask
+			pred    = pred * mask
 			loss	= self.model.loss(pred, label)
 			loss.backward()
 			self.optimizer.step()

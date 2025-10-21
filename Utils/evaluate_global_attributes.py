@@ -224,7 +224,6 @@ def main() -> None:
             "anomaly_property_damage",
             "anomaly_weapon",
             "anomaly_restraint_response",
-            "anomaly_vulnerable_victim",
             "anomaly_fire_smoke",
         ],
         help="Attribute slugs (without the 'attribute:' prefix) to evaluate.",

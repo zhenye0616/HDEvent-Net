@@ -3,14 +3,19 @@
 # End-to-end pipeline for segmenting event videos and regenerating KG artefacts.
 # Usage:
 #   bash scripts/build_event_kg.sh --data-root /path/to/UCFCrime_dataset/vitb \
-#       [--feature-split event_thr_10] [--segments-root Data/segments] \
-#       [--manifest-root Data/UCF_Crime] [--output-root Data/UCF_Crime] \
-#       [--target-events 10000] [--dt-min 10] [--dt-max 60] [--overlap 0.5] \
+#       [--feature-split event_thr_10] [--variant vitb] \
+#       [--segments-root Data/segments] [--manifest-root Data/manifests] \
+#       [--regenerate-manifests --manifest-source manifests/event_thr_10.txt] \
+#       [--output-root Data/UCF_Crime] [--target-events 10000] \
+#       [--dt-min 1000] [--dt-max 10000] [--overlap 0.5] \
 #       [--sample-period-ms 4] [--python python3]
 #
 # The script expects to be run from the repository root (HDEvent-Net).
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 print_usage() {
     sed -n '3,15p' "${BASH_SOURCE[0]}"
@@ -18,18 +23,26 @@ print_usage() {
 
 PYTHON="python3"
 FEATURE_SPLIT="event_thr_10"
+VARIANT=""
 SEGMENTS_ROOT="Data/segments"
-MANIFEST_ROOT="Data/UCF_Crime"
+MANIFEST_ROOT="Data/manifests"
+MANIFEST_SOURCE=""
 OUTPUT_ROOT="Data/UCF_Crime"
 SEGMENT_ATTRS_ROOT="Data/segment_attributes"
 ATTRIBUTES_PATH="Data/attributes.json"
 TARGET_EVENTS=10000
-DT_MIN=10
-DT_MAX=60
+DT_MIN=1000
+DT_MAX=10000
 OVERLAP=0.5
 SAMPLE_PERIOD_MS=4
 SPLITS=("train" "val" "test")
 VERBOSE=0
+REGENERATE_MANIFESTS=0
+MANIFEST_CLASSES="all"
+MANIFEST_AUGMENTATIONS="5"
+MANIFEST_TRAIN_RATIO="0.8"
+MANIFEST_VAL_RATIO="0.1"
+MANIFEST_TEST_RATIO="0.1"
 
 DATA_ROOT="/mnt/Data_1/UCFCrime_dataset/vitb"
 
@@ -47,8 +60,16 @@ while [[ $# -gt 0 ]]; do
             SEGMENTS_ROOT="$2"
             shift 2
             ;;
+        --variant)
+            VARIANT="$2"
+            shift 2
+            ;;
         --manifest-root)
             MANIFEST_ROOT="$2"
+            shift 2
+            ;;
+        --manifest-source)
+            MANIFEST_SOURCE="$2"
             shift 2
             ;;
         --output-root)
@@ -87,6 +108,34 @@ while [[ $# -gt 0 ]]; do
             IFS=',' read -r -a SPLITS <<< "$2"
             shift 2
             ;;
+        --regenerate-manifests)
+            REGENERATE_MANIFESTS=1
+            shift 1
+            ;;
+        --skip-manifest-regeneration)
+            REGENERATE_MANIFESTS=0
+            shift 1
+            ;;
+        --manifest-classes)
+            MANIFEST_CLASSES="$2"
+            shift 2
+            ;;
+        --manifest-augmentations)
+            MANIFEST_AUGMENTATIONS="$2"
+            shift 2
+            ;;
+        --train-ratio)
+            MANIFEST_TRAIN_RATIO="$2"
+            shift 2
+            ;;
+        --val-ratio)
+            MANIFEST_VAL_RATIO="$2"
+            shift 2
+            ;;
+        --test-ratio)
+            MANIFEST_TEST_RATIO="$2"
+            shift 2
+            ;;
         --python)
             PYTHON="$2"
             shift 2
@@ -107,13 +156,64 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "${DATA_ROOT}" != /* ]]; then
+    DATA_ROOT="${PROJECT_ROOT}/${DATA_ROOT}"
+fi
+DATA_ROOT="${DATA_ROOT%/}"
+if [[ -z "${VARIANT}" ]]; then
+    VARIANT="$(basename "${DATA_ROOT}")"
+fi
+if [[ "${SEGMENTS_ROOT}" != /* ]]; then
+    SEGMENTS_ROOT="${PROJECT_ROOT}/${SEGMENTS_ROOT}"
+fi
+if [[ "${MANIFEST_ROOT}" != /* ]]; then
+    MANIFEST_ROOT="${PROJECT_ROOT}/${MANIFEST_ROOT}"
+fi
+if [[ -n "${MANIFEST_SOURCE}" && "${MANIFEST_SOURCE}" != /* ]]; then
+    MANIFEST_SOURCE="${PROJECT_ROOT}/${MANIFEST_SOURCE}"
+fi
+if [[ "${OUTPUT_ROOT}" != /* ]]; then
+    OUTPUT_ROOT="${PROJECT_ROOT}/${OUTPUT_ROOT}"
+fi
+if [[ -n "${SEGMENT_ATTRS_ROOT}" && "${SEGMENT_ATTRS_ROOT}" != /* ]]; then
+    SEGMENT_ATTRS_ROOT="${PROJECT_ROOT}/${SEGMENT_ATTRS_ROOT}"
+fi
+if [[ "${ATTRIBUTES_PATH}" != /* ]]; then
+    ATTRIBUTES_PATH="${PROJECT_ROOT}/${ATTRIBUTES_PATH}"
+fi
+
 if [[ -z "${DATA_ROOT}" ]]; then
     echo "[ERROR] --data-root is required."
     print_usage
     exit 1
 fi
 
-PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ ${REGENERATE_MANIFESTS} -eq 1 ]]; then
+    if [[ -z "${MANIFEST_SOURCE}" ]]; then
+        echo "[ERROR] --manifest-source is required when --regenerate-manifests is set."
+        exit 1
+    fi
+    echo "[INFO] Regenerating manifests in ${MANIFEST_ROOT}"
+    mkdir -p "${MANIFEST_ROOT}"
+    bash "${SCRIPT_DIR}/generate_split.sh" \
+        --manifest "${MANIFEST_SOURCE}" \
+        --output-root "${MANIFEST_ROOT}" \
+        --variant "${VARIANT}" \
+        --feature-split "${FEATURE_SPLIT}" \
+        --classes "${MANIFEST_CLASSES}" \
+        --augmentations "${MANIFEST_AUGMENTATIONS}" \
+        --train-ratio "${MANIFEST_TRAIN_RATIO}" \
+        --val-ratio "${MANIFEST_VAL_RATIO}" \
+        --test-ratio "${MANIFEST_TEST_RATIO}"
+fi
+
+for split in "${SPLITS[@]}"; do
+    if [[ ! -f "${MANIFEST_ROOT}/${split}.txt" ]]; then
+        echo "[ERROR] Manifest missing: ${MANIFEST_ROOT}/${split}.txt"
+        exit 1
+    fi
+done
+
 cd "${PROJECT_ROOT}"
 
 VERBOSE_ARG=()

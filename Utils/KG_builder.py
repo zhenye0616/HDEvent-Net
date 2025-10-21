@@ -3,7 +3,15 @@ import json
 import random
 import re
 from pathlib import Path
+from collections import Counter
 from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
+
+
+DEFAULT_INVERSE_RELATIONS: Dict[str, str] = {
+    "has_attribute": "has_attribute_reverse",
+    "part_of": "part_of_reverse",
+    "class_of": "class_of_reverse",
+}
 
 
 def _slugify(text: str) -> str:
@@ -205,6 +213,30 @@ def _load_manifest_videos(manifest_root: Path, split: str) -> Dict[str, Optional
     return videos
 
 
+def _augment_with_inverse(
+    triples: List[Tuple[str, str, str]],
+    inverse_relations: Dict[str, str],
+) -> List[Tuple[str, str, str]]:
+    if not triples:
+        return []
+
+    augmented: List[Tuple[str, str, str]] = list(triples)
+    counts = Counter(triples)
+    for triple, count in list(counts.items()):
+        head, relation, tail = triple
+        inverse_relation = inverse_relations.get(relation)
+        if not inverse_relation:
+            continue
+        inverse_triple = (tail, inverse_relation, head)
+        current = counts.get(inverse_triple, 0)
+        deficit = count - current
+        if deficit <= 0:
+            continue
+        augmented.extend([inverse_triple] * deficit)
+        counts[inverse_triple] = current + deficit
+    return augmented
+
+
 def _iter_structure_triples(
     video_entity: str,
     class_slug: Optional[str],
@@ -280,11 +312,16 @@ def build_triple_files(
     attr_val_ratio: float = 0.1,
     attr_test_ratio: float = 0.1,
     split_seed: int = 42,
+    include_inverse: bool = True,
+    inverse_relations: Optional[Dict[str, str]] = None,
 ) -> None:
     segments_root = Path(segments_root)
     manifest_root = Path(manifest_root)
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+
+    if include_inverse:
+        inverse_relations = dict(inverse_relations or DEFAULT_INVERSE_RELATIONS)
 
     structural_triples: Set[Tuple[str, str, str]] = set()
     split_triples: Set[Tuple[str, str, str]] = set()
@@ -399,6 +436,11 @@ def build_triple_files(
     val_lines = val_attr_sorted
     test_lines = test_attr_sorted
 
+    if include_inverse and inverse_relations:
+        train_lines = _augment_with_inverse(train_lines, inverse_relations)
+        val_lines = _augment_with_inverse(val_lines, inverse_relations)
+        test_lines = _augment_with_inverse(test_lines, inverse_relations)
+
     for split_name, split_lines in (("train", train_lines), ("val", val_lines), ("test", test_lines)):
         out_path = output_root / f"{split_name}.txt"
         with out_path.open("w", encoding="utf-8") as handle:
@@ -423,6 +465,7 @@ def _build_triples_cli(args: argparse.Namespace) -> None:
         attr_val_ratio=args.attr_split[1],
         attr_test_ratio=args.attr_split[2],
         split_seed=args.split_seed,
+        include_inverse=args.include_inverse,
     )
 
 
@@ -477,6 +520,13 @@ def _parse_cli_arguments() -> argparse.Namespace:
         default=42,
         help="Random seed for attribute triple splitting.",
     )
+    build_parser.add_argument(
+        "--no-inverse",
+        dest="include_inverse",
+        action="store_false",
+        help="Disable automatic generation of inverse triples.",
+    )
+    build_parser.set_defaults(include_inverse=True)
 
     return parser.parse_args()
 

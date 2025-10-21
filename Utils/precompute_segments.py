@@ -1,7 +1,7 @@
 import argparse
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional
 
@@ -16,7 +16,17 @@ class Segment:
     start_ms: int
     end_ms: int
     n_events: int
-    flags: List[str]
+    start_idx: int
+    end_idx: int
+    mid_ms: int
+    duration_ms: int
+    seg_idx: int
+    flags: List[str] = field(default_factory=list)
+    video_id: str = ""
+    feature_mean: Optional[float] = None
+    feature_std: Optional[float] = None
+    feature_min: Optional[float] = None
+    feature_max: Optional[float] = None
 
 
 def setup_logger(verbose: bool) -> logging.Logger:
@@ -261,12 +271,38 @@ def adaptive_segment(
                 seg_flags.append("short_tail")
 
         seg_name = name_factory(seg_idx, start_idx, end_idx)
+        duration_ms = max(0, dt)
+        mid_ts = start_ts + (duration_ms // 2)
+
+        feature_mean: Optional[float] = None
+        feature_std: Optional[float] = None
+        feature_min: Optional[float] = None
+        feature_max: Optional[float] = None
+        features = events.get("features")
+        if features is not None and end_idx >= start_idx:
+            window = features[start_idx : end_idx + 1]
+            if getattr(window, "size", 0):
+                flat = window.reshape(-1)
+                feature_mean = float(flat.mean())
+                feature_std = float(flat.std())
+                feature_min = float(flat.min())
+                feature_max = float(flat.max())
+
         yield Segment(
             seg_name=seg_name,
             start_ms=start_ts,
             end_ms=end_ts,
             n_events=count,
+            start_idx=start_idx,
+            end_idx=end_idx,
+            mid_ms=mid_ts,
+            duration_ms=duration_ms,
+            seg_idx=seg_idx,
             flags=seg_flags,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
+            feature_min=feature_min,
+            feature_max=feature_max,
         )
 
         seg_idx += 1
@@ -346,8 +382,18 @@ def main() -> None:
         help="Optional subdirectory under data_root for feature files (e.g., event_thr_10).",
     )
     parser.add_argument("--target-events", type=int, default=10_000)
-    parser.add_argument("--dt-min", type=int, default=10, help="Minimum span (ms).")
-    parser.add_argument("--dt-max", type=int, default=60, help="Maximum span (ms).")
+    parser.add_argument(
+        "--dt-min",
+        type=int,
+        default=1_000,
+        help="Minimum segment span in milliseconds (default: 1000).",
+    )
+    parser.add_argument(
+        "--dt-max",
+        type=int,
+        default=10_000,
+        help="Maximum segment span in milliseconds (default: 10000).",
+    )
     parser.add_argument(
         "--overlap",
         type=float,
@@ -403,6 +449,7 @@ def main() -> None:
             )
 
             canonical_vid = _canonical_video_id(video_id)
+            canonical_video_entity = f"{args.video_prefix}:{canonical_vid}"
 
             def name_factory(idx: int, start_idx: int, end_idx: int) -> str:
                 return (
@@ -420,6 +467,9 @@ def main() -> None:
                     name_factory=name_factory,
                 )
             )
+
+            for segment in segments:
+                segment.video_id = canonical_video_entity
 
             write_segments(split, video_id, segments, args.output_root)
             logger.debug(

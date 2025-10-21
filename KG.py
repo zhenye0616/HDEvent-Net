@@ -10,6 +10,9 @@ import logging
 
 class Runner(object):
 
+	def _inverse_rel(self, rel_idx: int) -> int:
+		return rel_idx + self.p.num_rel if rel_idx < self.p.num_rel else rel_idx - self.p.num_rel
+
 	def load_data(self):
 		"""
 		Reading in raw triples and converts it into a standard format. 
@@ -33,17 +36,28 @@ class Runner(object):
 
 		"""
 
-		ent_set, rel_set = OrderedSet(), OrderedSet()
+		ent_set: OrderedSet = OrderedSet()
+		base_rel_set: OrderedSet = OrderedSet()
+		raw_data = ddict(list)
+
 		for split in ['train', 'test', 'val']:
-			for line in open('./Data/{}/{}.txt'.format(self.p.dataset, split)):
-				sub, rel, obj = map(str.lower, line.strip().split('\t'))
-				ent_set.add(sub)
-				rel_set.add(rel)
-				ent_set.add(obj)
+			with open(f'./Data/{self.p.dataset}/{split}.txt', 'r') as handle:
+				for line in handle:
+					sub, rel, obj = map(str.lower, line.strip().split('\t'))
+					ent_set.add(sub)
+					ent_set.add(obj)
+					base_rel = rel[:-8] if rel.endswith('_reverse') else rel
+					base_rel_set.add(base_rel)
+					raw_data[split].append((sub, rel, obj))
 
 		self.ent2id = {ent: idx for idx, ent in enumerate(ent_set)}
-		self.rel2id = {rel: idx for idx, rel in enumerate(rel_set)}
-		self.rel2id.update({rel+'_reverse': idx+len(self.rel2id) for idx, rel in enumerate(rel_set)})
+
+		self.base_relations = list(base_rel_set)
+		self.rel2id = {}
+		for rel in self.base_relations:
+			self.rel2id[rel] = len(self.rel2id)
+		for rel in self.base_relations:
+			self.rel2id[f'{rel}_reverse'] = len(self.rel2id)
 
 		self.id2ent = {idx: ent for ent, idx in self.ent2id.items()}
 		self.id2rel = {idx: rel for rel, idx in self.rel2id.items()}
@@ -56,14 +70,14 @@ class Runner(object):
 		sr2o = ddict(set)
 
 		for split in ['train', 'test', 'val']:
-			for line in open('./Data/{}/{}.txt'.format(self.p.dataset, split)):
-				sub, rel, obj = map(str.lower, line.strip().split('\t'))
-				sub, rel, obj = self.ent2id[sub], self.rel2id[rel], self.ent2id[obj]
-				self.data[split].append((sub, rel, obj))
+			for sub, rel, obj in raw_data[split]:
+				sub_id, rel_id, obj_id = self.ent2id[sub], self.rel2id[rel], self.ent2id[obj]
+				self.data[split].append((sub_id, rel_id, obj_id))
 
-				if split == 'train': 
-					sr2o[(sub, rel)].add(obj)
-					sr2o[(obj, rel+self.p.num_rel)].add(sub)
+				if split == 'train':
+					sr2o[(sub_id, rel_id)].add(obj_id)
+					inv_rel = self._inverse_rel(rel_id)
+					sr2o[(obj_id, inv_rel)].add(sub_id)
 
 			self.logger.debug('[load_data] %s triples=%d', split, len(self.data[split]))
 
@@ -73,7 +87,7 @@ class Runner(object):
 		for split in ['test', 'val']:
 			for sub, rel, obj in self.data[split]:
 				sr2o[(sub, rel)].add(obj)
-				sr2o[(obj, rel+self.p.num_rel)].add(sub)
+				sr2o[(obj, self._inverse_rel(rel))].add(sub)
 
 		self.sr2o_all = {k: list(v) for k, v in sr2o.items()}
 		self.triples  = ddict(list)
@@ -83,9 +97,9 @@ class Runner(object):
 
 		for split in ['test', 'val']:
 			for sub, rel, obj in self.data[split]:
-				rel_inv = rel + self.p.num_rel
-				self.triples['{}_{}'.format(split, 'tail')].append({'triple': (sub, rel, obj), 	   'label': self.sr2o_all[(sub, rel)]})
-				self.triples['{}_{}'.format(split, 'head')].append({'triple': (obj, rel_inv, sub), 'label': self.sr2o_all[(obj, rel_inv)]})
+				rel_inv = self._inverse_rel(rel)
+				self.triples[f'{split}_tail'].append({'triple': (sub, rel, obj), 'label': self.sr2o_all[(sub, rel)]})
+				self.triples[f'{split}_head'].append({'triple': (obj, rel_inv, sub), 'label': self.sr2o_all[(obj, rel_inv)]})
 
 		self.triples = dict(self.triples)
 		self.logger.debug('[load_data] train pairs=%d val_pairs=%d test_pairs=%d',
@@ -136,11 +150,8 @@ class Runner(object):
 		for sub, rel, obj in self.data['train']:
 			edge_index.append((sub, obj))
 			edge_type.append(rel)
-
-		# Adding inverse edges
-		for sub, rel, obj in self.data['train']:
 			edge_index.append((obj, sub))
-			edge_type.append(rel + self.p.num_rel)
+			edge_type.append(self._inverse_rel(rel))
 
 		edge_index	= torch.LongTensor(edge_index).to(self.device).t()
 		edge_type	= torch.LongTensor(edge_type). to(self.device)

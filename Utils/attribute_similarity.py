@@ -629,8 +629,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--classes",
         nargs="+",
-        default=["Abuse", "Arrest", "Arson"],
-        help="Classes to analyze (default: Abuse Arrest Arson)",
+        default=[
+            "Abuse",
+            "Arrest",
+            "Arson",
+            "Assault",
+            "Burglary",
+            "Explosion",
+            "Fighting",
+            "Normal",
+            "RoadAccidents",
+            "Robbery",
+        ],
+        help="Classes to analyze (default: all 10 UCF-Crime categories)",
     )
     parser.add_argument(
         "--top-k",

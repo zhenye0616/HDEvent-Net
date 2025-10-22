@@ -13,10 +13,17 @@ class BaseModel(torch.nn.Module):
 
 		self.p		= params
 		self.act	= torch.tanh
-		self.bceloss	= torch.nn.BCELoss()
+		self.bceloss	= torch.nn.BCEWithLogitsLoss(reduction='none')
 
-	def loss(self, pred, true_label):
-		return self.bceloss(pred, true_label)
+	def loss(self, logits, true_label, mask=None):
+		loss = self.bceloss(logits, true_label)
+		if mask is not None:
+			loss = loss * mask
+			denom = mask.sum()
+		else:
+			denom = torch.tensor(loss.numel(), dtype=loss.dtype, device=loss.device)
+		denom = torch.clamp(denom, min=1.0)
+		return loss.sum() / denom
 		
 class CompGCNBase(BaseModel):
 	def __init__(self, edge_index, edge_type, num_rel, params=None):
@@ -108,10 +115,8 @@ class CompGCN_TransE(CompGCNBase):
 		sub_emb, rel_emb, all_ent, all_rel_emb	= self.forward_base(sub, rel, self.drop, self.drop)
 		obj_emb				= sub_emb + rel_emb
 
-		x	= self.p.gamma - torch.norm(obj_emb.unsqueeze(1) - all_ent, p=1, dim=2)		
-		score	= torch.sigmoid(x)
-
-		return score
+		x	= self.p.gamma - torch.norm(obj_emb.unsqueeze(1) - all_ent, p=1, dim=2)
+		return x
 
 class CompGCN_DistMult(CompGCNBase):
 	def __init__(self, edge_index, edge_type, params=None):
@@ -125,9 +130,7 @@ class CompGCN_DistMult(CompGCNBase):
 
 		x = torch.mm(obj_emb, all_ent.transpose(1, 0))
 		x += self.bias.expand_as(x)
-
-		score = torch.sigmoid(x)
-		return score
+		return x
 
 class GrapHD_DistMult(GrapHDBase):
 	def __init__(self, edge_index, edge_type, params=None) -> None:
@@ -140,9 +143,7 @@ class GrapHD_DistMult(GrapHDBase):
 		
 		x = torch.mm(obj_emb, all_ent.transpose(1, 0))
 		#x += self.bias.expand_as(x)
-		
-		score = torch.sigmoid(x)
-		return score
+		return x
 
 class GrapHD_TransE(GrapHDBase):
 	def __init__(self, edge_index, edge_type, params=None):
@@ -154,10 +155,8 @@ class GrapHD_TransE(GrapHDBase):
 		sub_emb, rel_emb, all_ent, all_rel_emb	= self.forward_base(sub, rel, self.drop, self.drop)
 		obj_emb				= sub_emb + rel_emb
 
-		x	= self.p.gamma - torch.norm(obj_emb.unsqueeze(1) - all_ent, p=1, dim=2)		
-		score	= torch.sigmoid(x)
-
-		return score
+		x	= self.p.gamma - torch.norm(obj_emb.unsqueeze(1) - all_ent, p=1, dim=2)
+		return x
 
 class CompGCN_ConvE(CompGCNBase):
 	def __init__(self, edge_index, edge_type, params=None):
@@ -201,6 +200,4 @@ class CompGCN_ConvE(CompGCNBase):
 
 		x = torch.mm(x, all_ent.transpose(1,0))
 		x += self.bias.expand_as(x)
-
-		score = torch.sigmoid(x)
-		return score
+		return x

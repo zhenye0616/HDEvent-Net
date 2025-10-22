@@ -6,6 +6,8 @@ from Model.models import *
 from copy import deepcopy
 import tqdm as tqdm
 import logging
+import random
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 
 class Runner(object):
@@ -66,6 +68,17 @@ class Runner(object):
 		self.p.num_rel		= len(self.rel2id) // 2
 		self.p.embed_dim	= self.p.k_w * self.p.k_h if self.p.embed_dim is None else self.p.embed_dim
 
+		self.segment_to_video: Dict[int, int] = {}
+		self.segment_to_class: Dict[int, int] = {}
+		self.video_to_segments: Dict[int, List[int]] = ddict(list)
+		self.video_to_class: Dict[int, int] = {}
+		self.class_to_videos: Dict[int, List[int]] = ddict(list)
+		self.segment_attrs: Dict[int, Set[int]] = ddict(set)
+		self.video_attrs: Dict[int, Set[int]] = ddict(set)
+		self.class_attrs: Dict[int, Set[int]] = ddict(set)
+		self.attribute_to_segments: Dict[int, Set[int]] = ddict(set)
+		self.segment_order: Dict[int, int] = {}
+
 		self.data = ddict(list)
 		sr2o = ddict(set)
 
@@ -78,6 +91,31 @@ class Runner(object):
 					sr2o[(sub_id, rel_id)].add(obj_id)
 					inv_rel = self._inverse_rel(rel_id)
 					sr2o[(obj_id, inv_rel)].add(sub_id)
+
+					rel_name = self.id2rel[rel_id]
+					is_reverse = rel_name.endswith('_reverse')
+					base_rel = rel_name[:-8] if is_reverse else rel_name
+					if base_rel == 'part_of':
+						if not is_reverse:
+							self.segment_to_video[sub_id] = obj_id
+							self.video_to_segments[obj_id].append(sub_id)
+						else:
+							self.segment_to_video[obj_id] = sub_id
+							self.video_to_segments[sub_id].append(obj_id)
+					elif base_rel == 'has_attribute':
+						if not is_reverse:
+							self.segment_attrs[sub_id].add(obj_id)
+							self.attribute_to_segments[obj_id].add(sub_id)
+						else:
+							self.segment_attrs[obj_id].add(sub_id)
+							self.attribute_to_segments[sub_id].add(obj_id)
+					elif base_rel == 'class_of':
+						if not is_reverse:
+							self.video_to_class[sub_id] = obj_id
+							self.class_to_videos[obj_id].append(sub_id)
+						else:
+							self.video_to_class[obj_id] = sub_id
+							self.class_to_videos[sub_id].append(obj_id)
 
 			self.logger.debug('[load_data] %s triples=%d', split, len(self.data[split]))
 
@@ -102,6 +140,32 @@ class Runner(object):
 				self.triples[f'{split}_head'].append({'triple': (obj, rel_inv, sub), 'label': self.sr2o_all[(obj, rel_inv)]})
 
 		self.triples = dict(self.triples)
+		# finalize auxiliary structures for negative sampling
+		for video, segments in self.video_to_segments.items():
+			unique_segments = list(dict.fromkeys(segments))
+			self.video_to_segments[video] = unique_segments
+			attr_acc = self.video_attrs[video]
+			for seg in unique_segments:
+				attr_acc.update(self.segment_attrs.get(seg, set()))
+		for cls, videos in self.class_to_videos.items():
+			unique_videos = list(dict.fromkeys(videos))
+			self.class_to_videos[cls] = unique_videos
+			attr_acc = self.class_attrs[cls]
+			for vid in unique_videos:
+				attr_acc.update(self.video_attrs.get(vid, set()))
+		for seg, vid in self.segment_to_video.items():
+			cls = self.video_to_class.get(vid)
+			if cls is not None:
+				self.segment_to_class[seg] = cls
+		for seg in self.segment_to_video.keys():
+			name = self.id2ent.get(seg, "")
+			token = name.split(':')[-1]
+			if '-' in token:
+				token = token.split('-')[0]
+			digits = ''.join(ch for ch in token if ch.isdigit())
+			if digits:
+				self.segment_order[seg] = int(digits)
+
 		self.logger.debug('[load_data] train pairs=%d val_pairs=%d test_pairs=%d',
 			len(self.triples.get('train', [])),
 			len(self.triples.get('val_tail', [])),
@@ -194,6 +258,14 @@ class Runner(object):
 		self.load_data()
 		self.model        = self.add_model(self.p.model, self.p.score_func)
 		self.optimizer    = self.add_optimizer(self.model.parameters())
+		self.neg_samples = getattr(self.p, 'neg_samples', 32)
+		self.neg_local_ratio = getattr(self.p, 'neg_local_ratio', 0.8)
+		self.neg_inbatch_k = getattr(self.p, 'neg_inbatch_k', 4)
+		self.neg_cache_size = getattr(self.p, 'neg_cache_size', 32)
+		self.neg_cache_use = getattr(self.p, 'neg_cache_use', 8)
+		self.neg_time_window = getattr(self.p, 'neg_time_window', 3)
+		self.neg_cache: Dict[Tuple[int, int], List[Tuple[int, float]]] = {}
+		self._grad_names: Optional[List[str]] = None
 
 
 	def add_model(self, model, score_func):
@@ -377,9 +449,253 @@ class Runner(object):
 				mask_tensor[rel_id].scatter_(0, allowed_indices, 1.0)
 
 		self.tail_type_mask = mask_tensor
+		self.type_id_lists = {k: tensor.tolist() for k, tensor in self._type_index_tensors.items()}
+		all_classes = self.type_id_lists.get('class', [])
+		anomaly_ids = [cid for cid in all_classes if 'normal' not in self.id2ent.get(cid, '')]
+		normal_ids = [cid for cid in all_classes if 'normal' in self.id2ent.get(cid, '')]
+		self.class_groups: Dict[int, List[int]] = {}
+		for cid in all_classes:
+			if cid in anomaly_ids and len(anomaly_ids) > 1:
+				group = [x for x in anomaly_ids if x != cid]
+			elif cid in normal_ids and len(normal_ids) > 1:
+				group = [x for x in normal_ids if x != cid]
+			else:
+				group = [x for x in all_classes if x != cid]
+			self.class_groups[cid] = group
+		self.anomaly_classes = anomaly_ids
+		self.normal_classes = normal_ids
+		self.all_class_ids = all_classes
 
 	def _get_tail_mask(self, rel_ids: torch.Tensor) -> torch.Tensor:
 		return self.tail_type_mask.index_select(0, rel_ids)
+
+	def _build_train_mask(self, sub: torch.Tensor, rel: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
+		batch_size = rel.size(0)
+		mask = torch.zeros_like(label)
+		all_pos_indices: List[List[int]] = []
+		for i in range(batch_size):
+			pos = (label[i] > 0).nonzero(as_tuple=False).flatten().tolist()
+			if not pos:
+				pos = []
+			all_pos_indices.append(pos)
+		for i in range(batch_size):
+			head_id = sub[i].item()
+			rel_id = rel[i].item()
+			pos_list = all_pos_indices[i]
+			selected = set(pos_list)
+			negatives = self._sample_negatives(head_id, rel_id, pos_list, rel, all_pos_indices, i)
+			selected.update(negatives)
+			if not selected:
+				continue
+			mask[i, list(selected)] = 1.0
+		return mask
+
+	def _sample_negatives(
+		self,
+		head_id: int,
+		rel_id: int,
+		pos_list: List[int],
+		rel_tensor: torch.Tensor,
+		all_pos_indices: List[List[int]],
+		index: int,
+	) -> List[int]:
+		if self.neg_samples <= 0:
+			return []
+		pos_set = set(pos_list)
+		negatives: List[int] = []
+		exclude = set(pos_list)
+
+		rel_name = self.id2rel[rel_id]
+		is_reverse = rel_name.endswith('_reverse')
+		base_rel = rel_name[:-8] if is_reverse else rel_name
+
+		local_candidates = self._collect_local_candidates(base_rel, is_reverse, head_id, pos_set)
+		local_target = int(self.neg_samples * self.neg_local_ratio)
+		local_selected = self._sample_from_pool(local_candidates, local_target, exclude)
+		negatives.extend(local_selected)
+		exclude.update(local_selected)
+
+		# cached negatives
+		cache_key = (head_id, rel_id)
+		if self.neg_cache_use > 0:
+			cache = self.neg_cache.get(cache_key, [])
+			for tail_id, _ in cache:
+				if tail_id in exclude:
+					continue
+				negatives.append(tail_id)
+				exclude.add(tail_id)
+				if len(negatives) >= self.neg_samples:
+					break
+
+		# in-batch negatives
+		if self.neg_inbatch_k > 0:
+			inbatch_candidates: List[int] = []
+			rel_val = rel_tensor[index].item()
+			for j in range(rel_tensor.size(0)):
+				if j == index or rel_tensor[j].item() != rel_val:
+					continue
+				for cand in all_pos_indices[j]:
+					if cand not in exclude:
+						inbatch_candidates.append(cand)
+			random.shuffle(inbatch_candidates)
+			for cand in inbatch_candidates[: self.neg_inbatch_k]:
+				if cand in exclude:
+					continue
+				negatives.append(cand)
+				exclude.add(cand)
+				if len(negatives) >= self.neg_samples:
+					break
+
+		target_type = 'attribute'
+		if base_rel == 'class_of':
+			target_type = 'video' if is_reverse else 'class'
+		elif base_rel == 'part_of':
+			target_type = 'segment' if is_reverse else 'video'
+		elif base_rel == 'has_attribute':
+			target_type = 'segment' if is_reverse else 'attribute'
+
+		global_needed = max(self.neg_samples - len(negatives), 0)
+		if global_needed > 0:
+			global_sample = self._sample_global_candidates(target_type, exclude, global_needed)
+			negatives.extend(global_sample)
+
+		if len(negatives) > self.neg_samples:
+			negatives = negatives[: self.neg_samples]
+		return negatives
+
+	def _collect_local_candidates(
+		self,
+		base_rel: str,
+		is_reverse: bool,
+		head_id: int,
+		pos_set: Set[int],
+	) -> Set[int]:
+		candidates: Set[int] = set()
+		if base_rel == 'has_attribute':
+			if not is_reverse:
+				segment = head_id
+				video = self.segment_to_video.get(segment)
+				if video is not None:
+					segments = self.video_to_segments.get(video, [])
+					order = self.segment_order.get(segment)
+					for seg in segments:
+						if self.segment_attrs.get(seg):
+							candidates.update(self.segment_attrs[seg])
+						if order is not None:
+							seg_order = self.segment_order.get(seg)
+							if seg_order is not None and abs(seg_order - order) <= self.neg_time_window:
+								candidates.update(self.segment_attrs.get(seg, set()))
+					cls = self.video_to_class.get(video)
+					if cls is not None:
+						candidates.update(self.class_attrs.get(cls, set()))
+				cls = self.segment_to_class.get(segment)
+				if cls is not None:
+					candidates.update(self.class_attrs.get(cls, set()))
+			else:
+				attribute = head_id
+				segments = self.attribute_to_segments.get(attribute, set())
+				for seg in segments:
+					video = self.segment_to_video.get(seg)
+					if video is not None:
+						candidates.update(self.video_to_segments.get(video, []))
+						cls = self.video_to_class.get(video)
+						if cls is not None:
+							for vid in self.class_to_videos.get(cls, []):
+								candidates.update(self.video_to_segments.get(vid, []))
+					order = self.segment_order.get(seg)
+					if order is not None:
+						video_segments = self.video_to_segments.get(self.segment_to_video.get(seg, -1), [])
+						for other in video_segments:
+							seg_order = self.segment_order.get(other)
+							if seg_order is not None and abs(seg_order - order) <= self.neg_time_window:
+								candidates.add(other)
+		elif base_rel == 'class_of':
+			if not is_reverse:
+				segment = head_id
+				cls = self.segment_to_class.get(segment)
+				if cls is not None:
+					group = self.class_groups.get(cls, [cid for cid in self.all_class_ids if cid != cls])
+					candidates.update(group)
+			else:
+				cls = head_id
+				candidates.update(self.class_to_videos.get(cls, []))
+		elif base_rel == 'part_of':
+			if not is_reverse:
+				segment = head_id
+				video = self.segment_to_video.get(segment)
+				if video is not None:
+					cls = self.video_to_class.get(video)
+					if cls is not None:
+						candidates.update(self.class_to_videos.get(cls, []))
+					if video in candidates:
+						candidates.discard(video)
+			else:
+				video = head_id
+				candidates.update(self.video_to_segments.get(video, []))
+		candidates.difference_update(pos_set)
+		return candidates
+
+	def _sample_from_pool(self, candidates: Set[int], count: int, exclude: Set[int]) -> List[int]:
+		if count <= 0 or not candidates:
+			return []
+		available = list(candidates - exclude)
+		if not available:
+			return []
+		if len(available) <= count:
+			return available
+		return random.sample(available, count)
+
+	def _sample_global_candidates(self, type_key: str, exclude: Set[int], count: int) -> List[int]:
+		if count <= 0:
+			return []
+		population = self.type_id_lists.get(type_key, [])
+		if not population:
+			return []
+		result: List[int] = []
+		attempts = 0
+		max_attempts = count * 10 + 1
+		while len(result) < count and attempts < max_attempts:
+			cand = random.choice(population)
+			attempts += 1
+			if cand in exclude:
+				continue
+			result.append(cand)
+			exclude.add(cand)
+		return result
+
+	def _update_neg_cache(
+		self,
+		sub: torch.Tensor,
+		rel: torch.Tensor,
+		label: torch.Tensor,
+		scores: torch.Tensor,
+		mask: torch.Tensor,
+	) -> None:
+		for i in range(sub.size(0)):
+			head_id = sub[i].item()
+			rel_id = rel[i].item()
+			key = (head_id, rel_id)
+			pos_idx = (label[i] > 0).nonzero(as_tuple=False).flatten().tolist()
+			if not pos_idx:
+				continue
+			candidate_idx = ((mask[i] > 0) & (label[i] == 0)).nonzero(as_tuple=False).flatten().tolist()
+			if not candidate_idx:
+				continue
+			score_vals = scores[i, candidate_idx]
+			pairs = list(zip(candidate_idx, score_vals.tolist()))
+			cache = self.neg_cache.get(key, [])
+			cache.extend(pairs)
+			cache.sort(key=lambda x: x[1], reverse=True)
+			new_cache: List[Tuple[int, float]] = []
+			seen: Set[int] = set()
+			for tail_id, sc in cache:
+				if tail_id in pos_idx or tail_id in seen:
+					continue
+				new_cache.append((tail_id, sc))
+				seen.add(tail_id)
+				if len(new_cache) >= self.neg_cache_size:
+					break
+			self.neg_cache[key] = new_cache
 
 	def predict(self, split='val', mode='tail_batch'):
 		"""
@@ -444,6 +760,7 @@ class Runner(object):
 		self.model.train()
 		losses = []
 		train_iter = iter(self.data_iter['train'])
+		grad_accum = {}
 
 		for step, batch in enumerate(train_iter):
 			#NOTE: Hanning measure training time
@@ -452,16 +769,37 @@ class Runner(object):
 
 			self.optimizer.zero_grad()
 			sub, rel, obj, label = self.read_batch(batch, 'train')
-			pred	= self.model.forward(sub, rel)
-			mask    = self._get_tail_mask(rel)
-			label   = label * mask
-			pred    = pred * mask
-			loss	= self.model.loss(pred, label)
+			scores	= self.model.forward(sub, rel)
+			mask    = self._build_train_mask(sub, rel, label)
+			masked_label = label * mask
+			loss	= self.model.loss(scores, label, mask)
 			loss.backward()
+
+			if self.logger.isEnabledFor(logging.DEBUG):
+				if self._grad_names is None:
+					names: List[str] = []
+					for name, param in self.model.named_parameters():
+						if param.grad is None:
+							continue
+						names.append(name)
+						if len(names) == 6:
+							break
+					self._grad_names = names
+				if grad_accum is None or not grad_accum:
+					grad_accum = {name: [0.0, 0] for name in (self._grad_names or [])}
+				for name, param in self.model.named_parameters():
+					if self._grad_names and name not in self._grad_names:
+						continue
+					if param.grad is None:
+						continue
+					stats = grad_accum.setdefault(name, [0.0, 0])
+					stats[0] += param.grad.norm().item()
+					stats[1] += 1
+
 			self.optimizer.step()
 
 			if self.logger.isEnabledFor(logging.DEBUG):
-				mean_pos = label.sum(dim=1).mean().item()
+				mean_pos = masked_label.sum(dim=1).mean().item()
 				self.logger.debug(
 					'[train] epoch=%d step=%d loss=%.6f mean_pos=%.3f sub[0]=%d rel[0]=%d',
 					epoch,
@@ -480,11 +818,21 @@ class Runner(object):
 			# print("===============================")
 
 			losses.append(loss.item())
+			self._update_neg_cache(sub, rel, label, scores, mask)
 
 			if step % 100 == 0:
 				self.logger.info('[E:{}| {}]: Train Loss:{:.5},  Val MRR:{:.5}\t{}'.format(epoch, step, np.mean(losses), self.best_val_mrr, self.p.name))
 
 		loss = np.mean(losses)
+		if self.logger.isEnabledFor(logging.DEBUG) and grad_accum:
+			summary = []
+			for name, (total, count) in grad_accum.items():
+				if count == 0:
+					continue
+				summary.append(f"{name}:{(total/count):.6e}")
+				if len(summary) >= 6:
+					break
+			self.logger.debug("[grad] epoch=%d %s", epoch, ", ".join(summary))
 		self.logger.info('[Epoch:{}]:  Training Loss:{:.4}\n'.format(epoch, loss))
 		return loss
 
@@ -558,12 +906,12 @@ if __name__ == '__main__':
 	parser.add_argument('-opn',             dest='opn',             default='corr',                 help='Composition Operation to be used in CompGCN')
 
 	parser.add_argument('-batch',           dest='batch_size',      default=128,    type=int,       help='Batch size')
-	parser.add_argument('-gamma',		type=float,             default=40.0,			help='Margin')
+	parser.add_argument('-gamma',		type=float,             default=5.0,			help='Margin')
 	parser.add_argument('-gpu',		type=str,               default='0',			help='Set GPU Ids : Eg: For CPU = -1, For Single GPU = 0')
 	parser.add_argument('-epoch',		dest='max_epochs', 	type=int,       default=500,  	help='Number of epochs')
 	parser.add_argument('-l2',		type=float,             default=0.0,			help='L2 Regularization for Optimizer')
 	parser.add_argument('-lr',		type=float,             default=0.001,			help='Starting Learning Rate')
-	parser.add_argument('-lbl_smooth',      dest='lbl_smooth',	type=float,     default=0.1,	help='Label Smoothing')
+	parser.add_argument('-lbl_smooth',      dest='lbl_smooth',	type=float,     default=0.0,	help='Label Smoothing')
 	parser.add_argument('-num_workers',	type=int,               default=10,                     help='Number of processes to construct batches')
 	parser.add_argument('-seed',            dest='seed',            default=41504,  type=int,     	help='Seed for randomization')
 
@@ -576,28 +924,34 @@ if __name__ == '__main__':
 	parser.add_argument('-embed_dim',	dest='embed_dim', 	default=None,   type=int, 	help='Embedding dimension to give as input to score function')
 	parser.add_argument('-gcn_layer',	dest='gcn_layer', 	default=1,   	type=int, 	help='Number of GCN Layers to use')
 	parser.add_argument('-gcn_drop',	dest='dropout', 	default=0.1,  	type=float,	help='Dropout to use in GCN Layer')
-	parser.add_argument('-hid_drop',  	dest='hid_drop', 	default=0.3,  	type=float,	help='Dropout after GCN')
+parser.add_argument('-hid_drop',  	dest='hid_drop', 	default=0.3,  	type=float,	help='Dropout after GCN')
 
-	# ConvE specific hyperparameters
-	parser.add_argument('-hid_drop2',  	dest='hid_drop2', 	default=0.3,  	type=float,	help='ConvE: Hidden dropout')
-	parser.add_argument('-feat_drop', 	dest='feat_drop', 	default=0.3,  	type=float,	help='ConvE: Feature Dropout')
-	parser.add_argument('-k_w',	  	dest='k_w', 		default=10,   	type=int, 	help='ConvE: k_w')
-	parser.add_argument('-k_h',	  	dest='k_h', 		default=20,   	type=int, 	help='ConvE: k_h')
-	parser.add_argument('-num_filt',  	dest='num_filt', 	default=200,   	type=int, 	help='ConvE: Number of filters in convolution')
-	parser.add_argument('-ker_sz',    	dest='ker_sz', 		default=7,   	type=int, 	help='ConvE: Kernel size to use')
+# ConvE specific hyperparameters
+parser.add_argument('-hid_drop2',  	dest='hid_drop2', 	default=0.3,  	type=float,	help='ConvE: Hidden dropout')
+parser.add_argument('-feat_drop', 	dest='feat_drop', 	default=0.3,  	type=float,	help='ConvE: Feature Dropout')
+parser.add_argument('-k_w',	  	dest='k_w', 		default=10,   	type=int, 	help='ConvE: k_w')
+parser.add_argument('-k_h',	  	dest='k_h', 		default=20,   	type=int, 	help='ConvE: k_h')
+parser.add_argument('-num_filt',  	dest='num_filt', 	default=200,   	type=int, 	help='ConvE: Number of filters in convolution')
+parser.add_argument('-ker_sz',    	dest='ker_sz', 		default=7,   	type=int, 	help='ConvE: Kernel size to use')
+parser.add_argument('--neg-samples', dest='neg_samples', default=32, type=int, help='Number of negative tails to sample per positive.')
+parser.add_argument('--neg-local-ratio', dest='neg_local_ratio', default=0.8, type=float, help='Fraction of negatives drawn from local buckets (rest global).')
+parser.add_argument('--neg-inbatch-k', dest='neg_inbatch_k', default=4, type=int, help='Number of in-batch hard negatives to include per positive.')
+parser.add_argument('--neg-cache-size', dest='neg_cache_size', default=32, type=int, help='FIFO cache size for hard negatives per (head, relation).')
+parser.add_argument('--neg-cache-use', dest='neg_cache_use', default=8, type=int, help='Number of cached negatives to reuse each step.')
+parser.add_argument('--neg-time-window', dest='neg_time_window', default=3, type=int, help='Temporal window (in segments) for local negative sampling.')
 
-	parser.add_argument('-logdir',          dest='log_dir',         default='./log/',               help='Log directory')
-	parser.add_argument('-config',          dest='config_dir',      default='./config/',            help='Config directory')
-	args = parser.parse_args()
+parser.add_argument('-logdir',          dest='log_dir',         default='./log/',               help='Log directory')
+parser.add_argument('-config',          dest='config_dir',      default='./config/',            help='Config directory')
+args = parser.parse_args()
 
-	if not args.restore: args.name = args.name + '_' + time.strftime('%d_%m_%Y') + '_' + time.strftime('%H:%M:%S')
+if not args.restore: args.name = args.name + '_' + time.strftime('%d_%m_%Y') + '_' + time.strftime('%H:%M:%S')
 
-	set_gpu(args.gpu)
-	np.random.seed(args.seed)
-	torch.manual_seed(args.seed)
+set_gpu(args.gpu)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
 
-	model = Runner(args)
-	model.fit()
+model = Runner(args)
+model.fit()
 
 
 """python KG.py \
@@ -608,5 +962,4 @@ if __name__ == '__main__':
   -epoch 100 \
   -batch 128 \
   -lr 1e-3 \
-  -gpu 1
-  -debug"""
+  -gpu 1"""

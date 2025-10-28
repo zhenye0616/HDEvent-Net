@@ -195,7 +195,7 @@ if [[ ${REGENERATE_MANIFESTS} -eq 1 ]]; then
     fi
     echo "[INFO] Regenerating manifests in ${MANIFEST_ROOT}"
     mkdir -p "${MANIFEST_ROOT}"
-    bash "${SCRIPT_DIR}/generate_split.sh" \
+    bash "${SCRIPT_DIR}/tools/generate_split.sh" \
         --manifest "${MANIFEST_SOURCE}" \
         --output-root "${MANIFEST_ROOT}" \
         --variant "${VARIANT}" \

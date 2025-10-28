@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 
 # Build KG triples with optional segment attribute integration.
-# Usage: bash scripts/build_triples.sh [--segments-root ...] [--manifest-root ...]
+# Usage: bash scripts/tools/build_triples.sh [--segments-root ...] [--manifest-root ...]
 #        [--output-root ...] [--segment-attrs-root ...] [--splits train,val,test]
 #        [--python python3]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 PYTHON_BIN="python3"

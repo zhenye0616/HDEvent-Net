@@ -90,7 +90,7 @@ HDEvent-Net/
 
 The typical workflow processes manifests, segments, attribute scores, and finally produces the KG used for training. Run the following in order when the upstream artefacts change:
 
-1. **Select videos for each split** – `scripts/generate_split.sh`
+1. **Select videos for each split** – `scripts/tools/generate_split.sh`
    - Filters the rich manifest into `Data/UCF_Crime/{train,val,test}.txt` based on class list and augmentation index.
    - Re-run only when you adjust which videos belong to each split.
 
@@ -98,11 +98,11 @@ The typical workflow processes manifests, segments, attribute scores, and finall
    - Invokes `Utils/precompute_segments.py` to write canonical segment JSONLs under `Data/segments/<split>/`.
    - Also regenerates structural triples (class/part/precedes). Skip this step if the segmentation config and raw features have not changed.
 
-3. **Score attributes per segment** – `scripts/run_segments.sh`
+3. **Score attributes per segment** – `scripts/tools/run_segments.sh`
    - Calls `Utils/attribute_similarity.py` with temporal logits and writes per-segment attribute files to `Data/segment_attributes/<split>/`.
    - Only needs rerunning when you change CLIP scoring parameters or regenerate segments.
 
-4. **Build KG triples (structure + attributes)** – `scripts/build_triples.sh --segment-attrs-root Data/segment_attributes`
+4. **Build KG triples (structure + attributes)** – `scripts/tools/build_triples.sh --segment-attrs-root Data/segment_attributes`
    - Reads the segment JSONLs and the corresponding attribute JSONLs to emit `has_attribute` edges alongside structural triples in `Data/UCF_Crime/{train,val,test}.txt`.
 
 5. **Rebuild ID mappings** – `python Utils/build_kg_indices.py ...`
@@ -111,7 +111,27 @@ The typical workflow processes manifests, segments, attribute scores, and finall
 6. **Train/evaluate** – `python KG.py ...`
    - Loads the refreshed KG files and trains GrapHD/CompGCN variants.
 
-Use the smaller helpers (`build_triples.sh`, `run_attribute_segments.sh`) for incremental updates; the full `build_event_kg.sh` orchestration is convenient when you want to regenerate everything from scratch.
+Use the smaller helpers (`scripts/tools/build_triples.sh`, `scripts/tools/run_segments.sh`) for incremental updates; the full `build_event_kg.sh` orchestration is convenient when you want to regenerate everything from scratch.
+
+### Anomaly Head (Frozen KG)
+
+Once a KG run is trained, export its entity embeddings and fit a lightweight anomaly head without altering the KG weights:
+
+```bash
+# 1) Export embeddings for videos/segments
+python scripts/export_embeddings.py \
+  --checkpoint checkpoints/<run_name>/model.pt \
+  --dataset UCF_Crime \
+  --output-dir exports/<run_name>
+
+# 2) Train simple heads on frozen embeddings
+python scripts/train_anomaly_head.py \
+  --embeddings exports/<run_name>/video_embeddings.pt \
+  --anomaly-classes exports/<run_name>/metadata.json \
+  --output-dir exports/<run_name>/anomaly_head_video
+```
+
+The export step writes `video_embeddings.pt`, `segment_embeddings.pt`, and a `metadata.json` listing anomaly classes. The training script reports binary anomaly accuracy and anomaly-class accuracy per split while saving a small `head.pt` checkpoint for later evaluation.
 
 ### Dataset Testing
 

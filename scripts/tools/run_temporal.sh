@@ -4,7 +4,7 @@
 # Computes logits_per_event (mimicking model(event, text))
 
 # Change to project root
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # Configuration
 DATA_ROOT="/mnt/Data_1/UCFCrime_dataset"

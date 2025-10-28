@@ -3,7 +3,7 @@
 Enumerate UCFCrime event feature files with class and augmentation metadata.
 
 Example:
-    python scripts/list_ucfcrime_videos.py --data-root /mnt/Data_1/UCFCrime_dataset/vitb \
+    python scripts/tools/list_ucfcrime_videos.py --data-root /mnt/Data_1/UCFCrime_dataset/vitb \
         --split event_thr_10 --output manifests/all_videos_event_thr_10.txt
 """
 

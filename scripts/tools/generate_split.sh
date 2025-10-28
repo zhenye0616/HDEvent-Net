@@ -3,7 +3,7 @@
 # Build per-class train/val/test manifests (default 80/10/10) from the rich event manifest.
 # Defaults: all classes, augmentation index 5.
 # Example:
-#   bash scripts/generate_split_from_manifest.sh \
+#   bash scripts/tools/generate_split.sh \
 #       --manifest HDEvent-Net/manifests/event_thr_10_manifest.txt \
 #       --output-root HDEvent-Net/Data/UCF_Crime \
 #       --variant vitb \
@@ -17,7 +17,7 @@ usage() {
 
 PYTHON_BIN="${PYTHON:-python3}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 MANIFEST="${PROJECT_ROOT}/manifests/event_thr_10.txt"
 OUTPUT_ROOT="${PROJECT_ROOT}/Data/UCF_Crime"
 VARIANT="vitb"

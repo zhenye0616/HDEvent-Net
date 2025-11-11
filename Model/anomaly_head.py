@@ -16,14 +16,35 @@ class AnomalyHead(nn.Module):
       - Optional multi-class logits over anomaly classes.
     """
 
-    def __init__(self, input_dim: int, num_classes: int):
+    def __init__(
+        self,
+        input_dim: int,
+        num_classes: int,
+        *,
+        use_mlp: bool = False,
+        hidden_dim: int = 256,
+        dropout: float = 0.3,
+    ):
         super().__init__()
-        self.binary_head = nn.Linear(input_dim, 1)
-        self.class_head = nn.Linear(input_dim, num_classes) if num_classes > 0 else None
+        self.use_mlp = use_mlp
+        feature_dim = hidden_dim if use_mlp else input_dim
+
+        if use_mlp:
+            self.shared = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+            )
+        else:
+            self.shared = None
+
+        self.binary_head = nn.Linear(feature_dim, 1)
+        self.class_head = nn.Linear(feature_dim, num_classes) if num_classes > 0 else None
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
-        logits_bin = self.binary_head(x)
-        logits_cls = self.class_head(x) if self.class_head is not None else None
+        feat = self.shared(x) if self.shared is not None else x
+        logits_bin = self.binary_head(feat)
+        logits_cls = self.class_head(feat) if self.class_head is not None else None
         return logits_bin, logits_cls
 
 

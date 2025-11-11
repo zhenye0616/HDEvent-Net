@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
@@ -27,7 +28,6 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 from tqdm import tqdm
 
 from Model.anomaly_head import AnomalyHead, MILAggregator
-
 
 @dataclass
 class SplitData:
@@ -71,7 +71,7 @@ def bag_collate(batch):
 
 def load_embeddings(path: Path) -> Dict[str, torch.Tensor | list]:
     payload = torch.load(path, map_location="cpu")
-    required = ["embeddings", "anomaly_labels", "class_labels", "splits"]
+    required = ["embeddings", "anomaly_labels", "class_labels", "splits", "names"]
     missing = [k for k in required if k not in payload]
     if missing:
         raise KeyError(f"{path} missing keys: {missing}")
@@ -114,7 +114,9 @@ def segment_to_video_name(segment_name: str) -> str:
     return f"video:{video_path}"
 
 
-def build_segment_splits(payload: Dict[str, torch.Tensor | list]) -> Dict[str, List[BagSample]]:
+def build_segment_splits(
+    payload: Dict[str, torch.Tensor | list],
+) -> Dict[str, List[BagSample]]:
     embeddings: torch.Tensor = payload["embeddings"]
     anomaly_labels = payload["anomaly_labels"]
     class_labels = payload["class_labels"]
@@ -133,6 +135,8 @@ def build_segment_splits(payload: Dict[str, torch.Tensor | list]) -> Dict[str, L
     for split, bags in grouped.items():
         samples: List[BagSample] = []
         for indices in bags.values():
+            if not indices:
+                continue
             index_tensor = torch.tensor(indices, dtype=torch.long)
             feats = embeddings.index_select(0, index_tensor)
             anomaly_vals = torch.tensor([anomaly_labels[i] for i in indices], dtype=torch.float32)
@@ -169,6 +173,104 @@ def compute_roc_auc(scores: torch.Tensor, labels: torch.Tensor) -> Optional[floa
     fpr = torch.cat([torch.tensor([0.0]), fpr])
     auc = torch.trapz(tpr, fpr).item()
     return auc
+
+
+def summarize_binary_predictions(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    default_threshold: float = 0.5,
+    recall_target: float = 0.9,
+) -> Dict[str, object]:
+    """Compute richer binary classification metrics from raw scores."""
+    summary: Dict[str, object] = {
+        "roc_auc": None,
+        "pr_auc": None,
+        "support": {"positive": 0, "negative": 0},
+        "best_f1": None,
+        "thresholds": {},
+    }
+    if scores.numel() == 0 or labels.numel() == 0:
+        return summary
+
+    scores = scores.reshape(-1).float().cpu()
+    labels = labels.reshape(-1).float().cpu()
+    pos_mask = labels == 1
+    neg_mask = labels == 0
+    pos_total = int(pos_mask.sum().item())
+    neg_total = int(neg_mask.sum().item())
+    summary["support"] = {"positive": pos_total, "negative": neg_total}
+
+    if pos_total == 0 or neg_total == 0:
+        return summary
+
+    sorted_scores, indices = torch.sort(scores, descending=True)
+    sorted_labels = labels[indices]
+
+    tp_cumsum = torch.cumsum((sorted_labels == 1).float(), dim=0)
+    fp_cumsum = torch.cumsum((sorted_labels == 0).float(), dim=0)
+    denom = tp_cumsum + fp_cumsum
+    precision = torch.where(denom > 0, tp_cumsum / denom, torch.ones_like(denom))
+    recall = tp_cumsum / pos_total
+
+    # Precision-recall AUC (append sentinels for a proper curve)
+    pr_precision = torch.cat(
+        [torch.tensor([1.0], dtype=torch.float32), precision, torch.tensor([0.0], dtype=torch.float32)]
+    )
+    pr_recall = torch.cat(
+        [torch.tensor([0.0], dtype=torch.float32), recall, torch.tensor([1.0], dtype=torch.float32)]
+    )
+    pr_auc = torch.trapz(pr_precision, pr_recall).item()
+    summary["pr_auc"] = pr_auc
+
+    roc_auc = compute_roc_auc(scores, labels)
+    summary["roc_auc"] = roc_auc
+
+    eps = 1e-8
+    f1_vals = 2 * precision * recall / torch.clamp(precision + recall, min=eps)
+    best_idx = int(torch.argmax(f1_vals).item())
+    best_threshold = float(sorted_scores[best_idx].item())
+
+    def threshold_stats(threshold: float) -> Dict[str, object]:
+        preds = (scores >= threshold).float()
+        tp = int(((preds == 1) & (labels == 1)).sum().item())
+        fp = int(((preds == 1) & (labels == 0)).sum().item())
+        fn = int(((preds == 0) & (labels == 1)).sum().item())
+        tn = int(((preds == 0) & (labels == 0)).sum().item())
+        precision_val = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall_val = tp / pos_total if pos_total > 0 else 0.0
+        denom_pr = precision_val + recall_val
+        f1_val = (2 * precision_val * recall_val / denom_pr) if denom_pr > 0 else 0.0
+        return {
+            "threshold": float(threshold),
+            "precision": float(precision_val),
+            "recall": float(recall_val),
+            "f1": float(f1_val),
+            "tp": tp,
+            "fp": fp,
+            "tn": tn,
+            "fn": fn,
+        }
+
+    summary["best_f1"] = {
+        **threshold_stats(best_threshold),
+        "curve_index": best_idx,
+    }
+
+    summary["thresholds"][f"{default_threshold:.2f}"] = threshold_stats(default_threshold)
+
+    if recall_target is not None:
+        mask = recall >= recall_target
+        if mask.any():
+            target_idx = int(torch.where(mask)[0][0].item())
+            target_threshold = float(sorted_scores[target_idx].item())
+            summary["thresholds"][f"recall@{recall_target:.2f}"] = {
+                **threshold_stats(target_threshold),
+                "target_recall": float(recall_target),
+                "curve_index": target_idx,
+            }
+
+    return summary
 
 
 def make_video_loader(split: SplitData, batch_size: int, shuffle: bool = True) -> DataLoader:
@@ -217,77 +319,204 @@ def prepare_batch(
     return feats_tensor, labels_bin, labels_cls
 
 
-def evaluate(
-    model: AnomalyHead,
-    loader: DataLoader,
-    device: torch.device,
+def sample_balanced_indices(
+    split: SplitData,
     num_classes: int,
+    per_class: int,
+    seed: int,
+) -> Tuple[Optional[torch.Tensor], List[int], int]:
+    if split.anomaly.numel() == 0:
+        return None, list(range(num_classes)), 0
+
+    anomalies = split.anomaly.reshape(-1)
+    classes = split.classes.reshape(-1) if split.classes.numel() == anomalies.numel() else None
+
+    generator = torch.Generator().manual_seed(seed)
+    pos_chunks: List[torch.Tensor] = []
+    missing: List[int] = []
+
+    for cls_id in range(num_classes):
+        mask = anomalies >= 0.5
+        if classes is not None:
+            mask = mask & (classes == cls_id)
+        cls_indices = torch.nonzero(mask, as_tuple=False).view(-1)
+        if cls_indices.numel() == 0:
+            missing.append(cls_id)
+            continue
+        if cls_indices.numel() >= per_class:
+            perm = torch.randperm(cls_indices.numel(), generator=generator)[:per_class]
+            chosen = cls_indices.index_select(0, perm)
+        else:
+            reps = torch.randint(0, cls_indices.numel(), (per_class,), generator=generator)
+            chosen = cls_indices.index_select(0, reps)
+        pos_chunks.append(chosen)
+
+    if not pos_chunks:
+        return None, missing, 0
+
+    pos_indices = torch.cat(pos_chunks, dim=0)
+    neg_indices = torch.nonzero(anomalies < 0.5, as_tuple=False).view(-1)
+    if neg_indices.numel() == 0:
+        return None, missing, 0
+
+    if neg_indices.numel() >= pos_indices.numel():
+        perm = torch.randperm(neg_indices.numel(), generator=generator)[:pos_indices.numel()]
+        neg_selected = neg_indices.index_select(0, perm)
+    else:
+        reps = torch.randint(0, neg_indices.numel(), (pos_indices.numel(),), generator=generator)
+        neg_selected = neg_indices.index_select(0, reps)
+
+    combined = torch.cat([pos_indices, neg_selected], dim=0)
+    combined = combined[torch.randperm(combined.numel(), generator=generator)]
+    return combined, missing, int(pos_indices.numel())
+
+
+def sample_balanced_bags(
+    bags: List[BagSample],
+    num_classes: int,
+    per_class: int,
+    seed: int,
+) -> Tuple[Optional[List[BagSample]], List[int], int]:
+    if not bags:
+        return None, list(range(num_classes)), 0
+
+    class_map: Dict[int, List[BagSample]] = {cls_id: [] for cls_id in range(num_classes)}
+    negatives: List[BagSample] = []
+
+    for bag in bags:
+        if float(bag.anomaly) >= 0.5 and bag.classes >= 0 and bag.classes < num_classes:
+            class_map.setdefault(bag.classes, []).append(bag)
+        elif float(bag.anomaly) < 0.5:
+            negatives.append(bag)
+
+    rng = random.Random(seed)
+    positives: List[BagSample] = []
+    missing: List[int] = []
+
+    for cls_id in range(num_classes):
+        candidates = class_map.get(cls_id, [])
+        if not candidates:
+            missing.append(cls_id)
+            continue
+        if len(candidates) >= per_class:
+            chosen = rng.sample(candidates, per_class)
+        else:
+            chosen = [rng.choice(candidates) for _ in range(per_class)]
+        positives.extend(chosen)
+
+    if not positives or not negatives:
+        return None, missing, 0
+
+    total_pos = len(positives)
+    if len(negatives) >= total_pos:
+        negative_choices = rng.sample(negatives, total_pos)
+    else:
+        negative_choices = [rng.choice(negatives) for _ in range(total_pos)]
+
+    combined = positives + negative_choices
+    rng.shuffle(combined)
+    return combined, missing, total_pos
+
+
+def evaluate(
+	model: AnomalyHead,
+	loader: DataLoader,
+	device: torch.device,
+	num_classes: int,
+    class_names: Optional[List[str]],
     criterion_bin: nn.Module,
     criterion_cls: nn.Module,
     granularity: str,
     aggregator: Optional[MILAggregator] = None,
 ) -> Tuple[float, Dict[str, float]]:
-    model.eval()
-    if aggregator is not None:
-        aggregator.eval()
-    total_loss = 0.0
-    total_samples = 0
-    correct_binary = 0
-    binary_count = 0
-    correct_cls = 0
-    cls_count = 0
-    prob_buffer: List[torch.Tensor] = []
-    label_buffer: List[torch.Tensor] = []
+	model.eval()
+	if aggregator is not None:
+		aggregator.eval()
+	total_loss = 0.0
+	total_samples = 0
+	prob_buffer: List[torch.Tensor] = []
+	label_buffer: List[torch.Tensor] = []
+	per_class_scores: Dict[int, List[torch.Tensor]] = {c: [] for c in range(num_classes)}
+	per_class_labels: Dict[int, List[torch.Tensor]] = {c: [] for c in range(num_classes)}
 
-    with torch.no_grad():
-        for batch in loader:
-            if len(batch) == 0:
-                continue
-            feats, labels_bin, labels_cls = prepare_batch(batch, device, granularity, aggregator)
-            if feats.numel() == 0:
-                continue
+	with torch.no_grad():
+		for batch in loader:
+			if len(batch) == 0:
+				continue
+			feats, labels_bin, labels_cls = prepare_batch(batch, device, granularity, aggregator)
+			if feats.numel() == 0:
+				continue
 
-            logits_bin, logits_cls = model(feats)
-            loss_bin = criterion_bin(logits_bin, labels_bin)
-            loss_cls = 0.0
+			logits_bin, logits_cls = model(feats)
+			loss_bin = criterion_bin(logits_bin, labels_bin)
+			loss_cls = torch.tensor(0.0, device=device)
 
-            probs = torch.sigmoid(logits_bin).detach().cpu().view(-1)
-            prob_buffer.append(probs)
-            label_buffer.append(labels_bin.detach().cpu().view(-1))
+			probs = torch.sigmoid(logits_bin).detach().cpu().view(-1)
+			prob_buffer.append(probs)
+			label_buffer.append(labels_bin.detach().cpu().view(-1))
 
-            preds_bin = (torch.sigmoid(logits_bin) >= 0.5).float()
-            correct_binary += (preds_bin == labels_bin).sum().item()
-            binary_count += labels_bin.size(0)
+			if num_classes > 0:
+				mask = labels_cls >= 0
+				if mask.any():
+					logits_masked = logits_cls[mask]
+					labels_masked = labels_cls[mask]
+					loss_cls = criterion_cls(logits_masked, labels_masked)
+					probs_cls = torch.softmax(logits_masked, dim=1).detach().cpu()
+					labels_masked_cpu = labels_masked.detach().cpu()
+					for class_idx in range(num_classes):
+						per_class_scores[class_idx].append(probs_cls[:, class_idx])
+						per_class_labels[class_idx].append((labels_masked_cpu == class_idx).float())
 
-            if num_classes > 0:
-                mask = labels_cls >= 0
-                if mask.any():
-                    logits_masked = logits_cls[mask]
-                    labels_masked = labels_cls[mask]
-                    loss_cls = criterion_cls(logits_masked, labels_masked)
-                    pred_cls = torch.argmax(logits_masked, dim=1)
-                    correct_cls += (pred_cls == labels_masked).sum().item()
-                    cls_count += labels_masked.size(0)
+			loss = loss_bin + loss_cls
+			total_loss += loss.item() * labels_bin.size(0)
+			total_samples += labels_bin.size(0)
 
-            loss = loss_bin + (loss_cls if isinstance(loss_cls, torch.Tensor) else loss_cls)
-            total_loss += loss.item() * labels_bin.size(0)
-            total_samples += labels_bin.size(0)
+	if total_samples == 0:
+		return 0.0, {
+            "mauc": None,
+            "roc_auc": None,
+            "pr_auc": None,
+            "support": {"positive": 0, "negative": 0},
+            "best_f1": None,
+            "thresholds": {},
+            "per_class_mauc": {str(i): None for i in range(num_classes)},
+            "per_class_metrics": {},
+        }
 
-    if total_samples == 0:
-        return 0.0, {"binary_accuracy": 0.0, "class_accuracy": 0.0, "roc_auc": None}
+	all_probs = torch.cat(prob_buffer) if prob_buffer else torch.empty(0)
+	all_labels = torch.cat(label_buffer) if label_buffer else torch.empty(0)
+	summary = summarize_binary_predictions(all_probs, all_labels)
 
-    all_probs = torch.cat(prob_buffer) if prob_buffer else torch.empty(0)
-    all_labels = torch.cat(label_buffer) if label_buffer else torch.empty(0)
-    roc_auc = compute_roc_auc(all_probs, all_labels)
+	per_class_mauc: Dict[str, Optional[float]] = {}
+	per_class_metrics: Dict[str, Dict[str, Optional[float]]] = {}
+	if num_classes > 0:
+		for class_idx in range(num_classes):
+			if per_class_scores[class_idx]:
+				class_scores = torch.cat(per_class_scores[class_idx])
+				class_labels = torch.cat(per_class_labels[class_idx])
+				roc = compute_roc_auc(class_scores, class_labels)
+			else:
+				roc = None
+			if class_names and class_idx < len(class_names):
+				key = class_names[class_idx]
+			else:
+				key = str(class_idx)
+			per_class_mauc[key] = roc
+			per_class_metrics[key] = {"roc_auc": roc}
 
-    metrics = {
-        "binary_accuracy": correct_binary / binary_count if binary_count else 0.0,
-        "class_accuracy": correct_cls / cls_count if cls_count else 0.0,
-        "roc_auc": roc_auc,
-    }
-    if aggregator is not None:
-        aggregator.train()
-    return total_loss / total_samples, metrics
+	metrics = {
+		"mauc": summary["roc_auc"],
+		"roc_auc": summary["roc_auc"],
+		"pr_auc": summary["pr_auc"],
+		"support": summary["support"],
+		"best_f1": summary["best_f1"],
+		"thresholds": summary["thresholds"],
+		"per_class_mauc": per_class_mauc,
+		"per_class_metrics": per_class_metrics,
+	}
+	if aggregator is not None:
+		aggregator.train()
+	return total_loss / total_samples, metrics
 
 
 def train_anomaly_head(
@@ -327,7 +556,13 @@ def train_anomaly_head(
             hidden_dim=args.mil_hidden,
         ).to(device)
 
-    model = AnomalyHead(embed_dim, num_classes).to(device)
+    model = AnomalyHead(
+        embed_dim,
+        num_classes,
+        use_mlp=args.mlp_head,
+        hidden_dim=args.mlp_hidden,
+        dropout=args.mlp_dropout,
+    ).to(device)
     trainable_params = list(model.parameters())
     if aggregator is not None:
         trainable_params += list(aggregator.parameters())
@@ -382,6 +617,7 @@ def train_anomaly_head(
             val_loader,
             device,
             num_classes,
+            anomaly_classes,
             criterion_bin,
             criterion_cls,
             granularity,
@@ -392,9 +628,10 @@ def train_anomaly_head(
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
-                "val_binary_accuracy": val_metrics["binary_accuracy"],
-                "val_class_accuracy": val_metrics["class_accuracy"],
-                "val_roc_auc": val_metrics["roc_auc"],
+                "val_mauc": val_metrics["mauc"],
+                "val_per_class_mauc": val_metrics["per_class_mauc"],
+                "val_pr_auc": val_metrics.get("pr_auc"),
+                "val_best_f1": val_metrics.get("best_f1"),
             }
         )
 
@@ -419,6 +656,7 @@ def train_anomaly_head(
         test_loader,
         device,
         num_classes,
+        anomaly_classes,
         criterion_bin,
         criterion_cls,
         granularity,
@@ -436,27 +674,192 @@ def train_anomaly_head(
         train_eval_loader,
         device,
         num_classes,
+        anomaly_classes,
         criterion_bin,
         criterion_cls,
         granularity,
         aggregator,
     )
 
+    balanced_eval: Dict[str, object] = {"enabled": bool(args.balanced_eval), "val": None, "test": None}
+    if args.balanced_eval:
+        eval_seed = args.balanced_eval_seed
+        per_class = max(1, args.balanced_samples_per_class)
+        if granularity == "video":
+            assert video_splits is not None
+            val_indices, val_missing, val_pos = sample_balanced_indices(
+                video_splits["val"], num_classes, per_class, eval_seed
+            )
+            val_missing_names = [
+                anomaly_classes[i] if i < len(anomaly_classes) else str(i) for i in val_missing
+            ]
+            if val_indices is not None:
+                balanced_val_split = SplitData(
+                    features=video_splits["val"].features.index_select(0, val_indices),
+                    anomaly=video_splits["val"].anomaly.index_select(0, val_indices),
+                    classes=video_splits["val"].classes.index_select(0, val_indices)
+                    if video_splits["val"].classes.numel() > 0
+                    else video_splits["val"].classes,
+                )
+                val_balanced_loader = make_video_loader(balanced_val_split, args.batch_size, shuffle=False)
+                _, balanced_val_metrics = evaluate(
+                    model,
+                    val_balanced_loader,
+                    device,
+                    num_classes,
+                    anomaly_classes,
+                    criterion_bin,
+                    criterion_cls,
+                    granularity,
+                    aggregator,
+                )
+                balanced_eval["val"] = {
+                    "metrics": balanced_val_metrics,
+                    "seed": eval_seed,
+                    "anomaly_samples": val_pos,
+                    "normal_samples": val_pos,
+                    "missing_classes": val_missing_names,
+                }
+            else:
+                balanced_eval["val"] = {
+                    "metrics": None,
+                    "seed": eval_seed,
+                    "anomaly_samples": 0,
+                    "normal_samples": 0,
+                    "missing_classes": val_missing_names,
+                }
+
+            test_indices, test_missing, test_pos = sample_balanced_indices(
+                video_splits["test"], num_classes, per_class, eval_seed
+            )
+            test_missing_names = [
+                anomaly_classes[i] if i < len(anomaly_classes) else str(i) for i in test_missing
+            ]
+            if test_indices is not None:
+                balanced_test_split = SplitData(
+                    features=video_splits["test"].features.index_select(0, test_indices),
+                    anomaly=video_splits["test"].anomaly.index_select(0, test_indices),
+                    classes=video_splits["test"].classes.index_select(0, test_indices)
+                    if video_splits["test"].classes.numel() > 0
+                    else video_splits["test"].classes,
+                )
+                test_balanced_loader = make_video_loader(balanced_test_split, args.batch_size, shuffle=False)
+                _, balanced_test_metrics = evaluate(
+                    model,
+                    test_balanced_loader,
+                    device,
+                    num_classes,
+                    anomaly_classes,
+                    criterion_bin,
+                    criterion_cls,
+                    granularity,
+                    aggregator,
+                )
+                balanced_eval["test"] = {
+                    "metrics": balanced_test_metrics,
+                    "seed": eval_seed,
+                    "anomaly_samples": test_pos,
+                    "normal_samples": test_pos,
+                    "missing_classes": test_missing_names,
+                }
+            else:
+                balanced_eval["test"] = {
+                    "metrics": None,
+                    "seed": eval_seed,
+                    "anomaly_samples": 0,
+                    "normal_samples": 0,
+                    "missing_classes": test_missing_names,
+                }
+        else:
+            assert segment_splits is not None
+            balanced_val_bags, val_missing, val_pos = sample_balanced_bags(
+                segment_splits["val"], num_classes, per_class, eval_seed
+            )
+            val_missing_names = [
+                anomaly_classes[i] if i < len(anomaly_classes) else str(i) for i in val_missing
+            ]
+            if balanced_val_bags is not None:
+                val_balanced_loader = make_bag_loader(balanced_val_bags, args.batch_size, shuffle=False)
+                _, balanced_val_metrics = evaluate(
+                    model,
+                    val_balanced_loader,
+                    device,
+                    num_classes,
+                    anomaly_classes,
+                    criterion_bin,
+                    criterion_cls,
+                    granularity,
+                    aggregator,
+                )
+                balanced_eval["val"] = {
+                    "metrics": balanced_val_metrics,
+                    "seed": eval_seed,
+                    "anomaly_samples": val_pos,
+                    "normal_samples": val_pos,
+                    "missing_classes": val_missing_names,
+                }
+            else:
+                balanced_eval["val"] = {
+                    "metrics": None,
+                    "seed": eval_seed,
+                    "anomaly_samples": 0,
+                    "normal_samples": 0,
+                    "missing_classes": val_missing_names,
+                }
+
+            balanced_test_bags, test_missing, test_pos = sample_balanced_bags(
+                segment_splits["test"], num_classes, per_class, eval_seed
+            )
+            test_missing_names = [
+                anomaly_classes[i] if i < len(anomaly_classes) else str(i) for i in test_missing
+            ]
+            if balanced_test_bags is not None:
+                test_balanced_loader = make_bag_loader(balanced_test_bags, args.batch_size, shuffle=False)
+                _, balanced_test_metrics = evaluate(
+                    model,
+                    test_balanced_loader,
+                    device,
+                    num_classes,
+                    anomaly_classes,
+                    criterion_bin,
+                    criterion_cls,
+                    granularity,
+                    aggregator,
+                )
+                balanced_eval["test"] = {
+                    "metrics": balanced_test_metrics,
+                    "seed": eval_seed,
+                    "anomaly_samples": test_pos,
+                    "normal_samples": test_pos,
+                    "missing_classes": test_missing_names,
+                }
+            else:
+                balanced_eval["test"] = {
+                    "metrics": None,
+                    "seed": eval_seed,
+                    "anomaly_samples": 0,
+                    "normal_samples": 0,
+                    "missing_classes": test_missing_names,
+                }
+
     return {
         "history": history,
         "best_val_loss": best_val_loss,
         "test_loss": test_loss,
-        "test_binary_accuracy": test_metrics["binary_accuracy"],
-        "test_class_accuracy": test_metrics["class_accuracy"],
-        "test_roc_auc": test_metrics["roc_auc"],
+        "test_mauc": test_metrics["mauc"],
+        "test_pr_auc": test_metrics.get("pr_auc"),
+        "test_per_class_mauc": test_metrics["per_class_mauc"],
         "train_eval_loss": train_eval_loss,
-        "train_binary_accuracy": train_eval_metrics["binary_accuracy"],
-        "train_class_accuracy": train_eval_metrics["class_accuracy"],
-        "train_roc_auc": train_eval_metrics["roc_auc"],
+        "train_mauc": train_eval_metrics["mauc"],
+        "train_pr_auc": train_eval_metrics.get("pr_auc"),
+        "train_per_class_mauc": train_eval_metrics["per_class_mauc"],
         "num_train_samples": num_train_samples,
         "num_val_samples": num_val_samples,
         "num_test_samples": num_test_samples,
         "anomaly_classes": anomaly_classes,
+        "test_metrics_full": test_metrics,
+        "train_eval_metrics_full": train_eval_metrics,
+        "balanced_eval": balanced_eval,
         "head_state_dict": model.state_dict(),
         "aggregator_state": aggregator.state_dict() if aggregator is not None else None,
         "aggregator_config": {
@@ -481,6 +884,12 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for optimizer.")
     parser.add_argument("--class-weight", type=float, default=1.0, help="Weight multiplier for multi-class loss.")
+    parser.add_argument("--mlp-head", action="store_true", help="Use a two-layer MLP anomaly head instead of a single linear layer.")
+    parser.add_argument("--mlp-hidden", type=int, default=256, help="Hidden dimension when MLP head is enabled.")
+    parser.add_argument("--mlp-dropout", type=float, default=0.3, help="Dropout rate for the MLP head.")
+    parser.add_argument("--balanced-eval", action="store_true", help="Report additional metrics on balanced val/test subsets (equal anomaly vs normal).")
+    parser.add_argument("--balanced-eval-seed", type=int, default=1234, help="Random seed used for balanced evaluation sampling.")
+    parser.add_argument("--balanced-samples-per-class", type=int, default=1, help="Number of anomaly samples to draw per class when building balanced eval subsets.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available.")
     args = parser.parse_args()
 
@@ -511,19 +920,22 @@ def main() -> None:
                 "history": results["history"],
                 "best_val_loss": results["best_val_loss"],
                 "test_loss": results["test_loss"],
-                "test_binary_accuracy": results["test_binary_accuracy"],
-                "test_class_accuracy": results["test_class_accuracy"],
-                "test_roc_auc": results["test_roc_auc"],
+                "test_mauc": results["test_mauc"],
+                "test_pr_auc": results["test_pr_auc"],
+                "test_metrics": results["test_metrics_full"],
+                "test_per_class_mauc": results["test_per_class_mauc"],
                 "train_eval_loss": results["train_eval_loss"],
-                "train_binary_accuracy": results["train_binary_accuracy"],
-                "train_class_accuracy": results["train_class_accuracy"],
-                "train_roc_auc": results["train_roc_auc"],
+                "train_mauc": results["train_mauc"],
+                "train_pr_auc": results["train_pr_auc"],
+                "train_eval_metrics": results["train_eval_metrics_full"],
+                "train_per_class_mauc": results["train_per_class_mauc"],
                 "num_train_samples": results["num_train_samples"],
                 "num_val_samples": results["num_val_samples"],
                 "num_test_samples": results["num_test_samples"],
                 "anomaly_classes": results["anomaly_classes"],
                 "granularity": args.granularity,
                 "mil_pooling": args.mil_pooling if args.granularity == "segment" else None,
+                "balanced_eval": results["balanced_eval"],
             },
             handle,
             indent=2,
